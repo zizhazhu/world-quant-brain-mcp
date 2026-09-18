@@ -33,7 +33,10 @@ services:
       retries: 3
 
   redis:
-    image: redis:6-alpine
+    # 2026-09-17: 6.2 已 EOL，升到 8.x（客户端 redis-py 已是 8.1）。
+    # Redis 8 首次启动会把旧的单文件 appendonly.aof 自动迁移进 appendonlydir/，
+    # 这是单向的：退回 redis:6 前必须先从备份恢复，否则 appendonly yes 会以空库启动。
+    image: redis:8-alpine
     container_name: mcp-redis
     restart: unless-stopped
     # Redis is now only the HOT tier: immutable platform data (datafields,
