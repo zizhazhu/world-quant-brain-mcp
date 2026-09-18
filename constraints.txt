@@ -8,8 +8,10 @@
 # 注意：playwright 的版本同时决定 `playwright install chromium` 装到哪个
 # chromium（1.63.0 ↔ chromium 153.0.8010.12），所以钉住它就等于钉住了浏览器。
 #
-# 本组合验证于 2026-09-17：容器 healthy、redis 8.1.0 连通 Redis 6.2.21、
-# playwright 起 chromium 153 并成功访问论坛。
+# 本组合验证于 2026-09-18（mcp 2.x 迁移后）：容器 healthy、
+# redis-py 8.1.0 连通 Redis 8.10.1、playwright 起 chromium 153。
+# 注意 mcp 2.x 用 httpx2/httpcore2（不是 httpx），并新增 mcp-types 与
+# opentelemetry-api；pydantic-settings 和 httpx-sse 不再是依赖。
 annotated-types==0.8.0
 anyio==4.15.1
 attrs==26.1.0
@@ -23,19 +25,19 @@ dnspython==2.8.0
 email-validator==2.3.0
 greenlet==3.5.6
 h11==0.16.0
-httpcore==1.0.9
-httpx-sse==0.4.3
-httpx==0.28.1
+httpcore2==2.13.0
+httpx2==2.13.0
 idna==3.20
 jsonschema-specifications==2025.9.1
 jsonschema==4.26.0
-mcp==1.30.0
+mcp-types==2.2.0
+mcp==2.2.0
 msgpack==1.2.2
 numpy==2.5.3
+opentelemetry-api==1.44.0
 pandas==2.3.3
 playwright==1.63.0
 pycparser==3.0
-pydantic-settings==2.15.0
 pydantic==2.13.5
 pydantic_core==2.46.5
 pyee==13.0.1
@@ -52,6 +54,7 @@ six==1.17.0
 soupsieve==2.9.2
 sse-starlette==3.4.11
 starlette==1.6.0
+truststore==0.10.4
 typing-inspection==0.4.4
 typing_extensions==4.16.0
 tzdata==2026.4

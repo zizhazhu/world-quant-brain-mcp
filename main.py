@@ -32,7 +32,7 @@ import requests
 import pandas as pd
 import zlib
 import msgpack
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from pydantic import BaseModel, Field, EmailStr, model_validator
 
 # Import the new forum client
@@ -7134,20 +7134,20 @@ except Exception:
     _MCP_PORT = 8000
 _MCP_STREAMABLE_HTTP_PATH = os.getenv("MCP_STREAMABLE_HTTP_PATH", "/mcp")
 
-mcp = FastMCP(
+# mcp 2.x: host/port/streamable_http_path 不再是构造参数，移到了 run()。
+# instructions 必须用关键字传——v1 的第 2 个位置参数就是 instructions，
+# v2 在它前面插入了 title/description，按位置传会被静默当成 title。
+mcp = MCPServer(
     "brain-platform-mcp",
-    "A server for interacting with the WorldQuant BRAIN platform",
-    host=_MCP_HOST,
-    port=_MCP_PORT,
-    streamable_http_path=_MCP_STREAMABLE_HTTP_PATH,
+    instructions="A server for interacting with the WorldQuant BRAIN platform",
 )
 
 # Add health check endpoint for container monitoring
-from mcp.server.fastmcp import Context
+from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 @mcp.custom_route('/health', methods=['GET'])
-async def health_check(context: Context):
+async def health_check(request: Request):
     """Health check endpoint for Docker container monitoring."""
     return JSONResponse({
         "status": "healthy",
@@ -10581,8 +10581,13 @@ if __name__ == "__main__":
     
     # Run using Streamable HTTP transport in container environment so the server remains
     # running and accessible over HTTP (not stdio which exits in non-interactive containers).
-    try:
-        mcp.run(transport='streamable-http')
-    except TypeError:
-        # Fallback if signature differs
-        mcp.run('streamable-http')
+    # 传输参数必须显式传：v2 的默认 host 是 127.0.0.1，容器里绑到 localhost
+    # 会让 0.0.0.0:8876->8000 的端口映射失效。原来的 except TypeError 兜底
+    # 正是不带 host/port 的调用，一旦触发就是静默故障，故移除——签名已由
+    # constraints.txt 钉死，宁可响亮地失败。
+    mcp.run(
+        transport='streamable-http',
+        host=_MCP_HOST,
+        port=_MCP_PORT,
+        streamable_http_path=_MCP_STREAMABLE_HTTP_PATH,
+    )

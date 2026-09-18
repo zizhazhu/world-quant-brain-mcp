@@ -9,7 +9,7 @@ redis>=8.1.0,<9.0.0
 pandas>=2.3.0,<3.0.0
 msgpack>=1.2.0,<2.0.0
 python-dotenv>=1.2.0,<2.0.0
-# mcp 2.x 把 FastMCP 改名成 MCPServer 并换用 httpx2，是硬断裂；
-# main.py 的 100+ 个 @mcp.tool() 迁移前保持 <2 上界。
-mcp>=1.30.0,<2.0.0
+# 已迁移到 mcp 2.x（FastMCP -> MCPServer）。2.x 的传输参数在 run() 上而非
+# 构造函数，且第 2 个位置参数从 instructions 变成了 title，见 main.py 注释。
+mcp>=2.2.0,<3.0.0
 email-validator>=2.3.0,<3.0.0
