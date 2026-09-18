@@ -139,18 +139,26 @@ def setup_chrome_for_playwright():
 
 
 def get_playwright_chrome_path():
+    """返回 Playwright 自带 chromium 的路径。
+
+    在子进程里问，因为 Playwright 的 sync/async API 都拒绝在已经运行的事件
+    循环里启动，而本模块的调用方全都在 async 上下文中。早先这里用
+    asyncio.run()，在事件循环里必定抛异常并被静默吞掉，于是逻辑会一路掉到
+    下载 Chrome .deb 的兜底分支。
+    """
+    code = (
+        "from playwright.sync_api import sync_playwright\n"
+        "with sync_playwright() as p:\n"
+        "    print(p.chromium.executable_path)\n"
+    )
     try:
-        import asyncio
-        from playwright.async_api import async_playwright
-
-        async def get_path():
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
-                executable_path = browser.executable_path
-                await browser.close()
-                return executable_path
-
-        return asyncio.run(get_path())
+        result = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True, timeout=60
+        )
+        if result.returncode != 0:
+            log(f"获取 Playwright Chrome 路径失败: {result.stderr.strip()[:200]}", "WARNING")
+            return None
+        return result.stdout.strip() or None
     except Exception as e:
         log(f"获取 Playwright Chrome 路径失败: {e}", "WARNING")
         return None
@@ -158,6 +166,13 @@ def get_playwright_chrome_path():
 
 def ensure_browser_available():
     log("检查浏览器可用性...", "INFO")
+
+    # 容器里由 `playwright install chromium` 提供配套浏览器。此时不要去找系统
+    # 浏览器：系统 chromium 的版本由发行版决定，迟早和 playwright 漂移开。
+    # 返回 None 表示"不指定 executable_path"，调用方会让 playwright 用自带的。
+    if os.environ.get("PLAYWRIGHT_BUNDLED_BROWSER", "").strip().lower() in ("1", "true", "yes"):
+        log("PLAYWRIGHT_BUNDLED_BROWSER 已设置，使用 Playwright 自带 chromium", "INFO")
+        return None
 
     system_browser = find_system_browser()
     if system_browser:

@@ -414,6 +414,10 @@ class ForumClient:
             
         try:
             context = await asyncio.wait_for(
+                # 不要删这个 user_agent：--headless=new 会让 chromium 在 UA 里自报
+                # HeadlessChrome/<ver>，论坛前面的 Cloudflare 见到就返回 403 挑战页。
+                # 实测（2026-09-17）：去掉本行未登录访问 support.worldquantbrain.com
+                # 得到 403 Just a moment...；保留则 200 正常跳登录页。
                 browser.new_context(user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36'),
                 timeout=timeout_seconds
             )
