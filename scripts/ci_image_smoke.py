@@ -57,7 +57,7 @@ async def check_runtime():
     from mcp.client.streamable_http import streamable_http_client
 
     async def check_protocol():
-        async with streamable_http_client('http://127.0.0.1:8000/mcp') as (read, write, _):
+        async with streamable_http_client('http://127.0.0.1:8000/mcp') as (read, write):
             async with ClientSession(read, write) as client:
                 await client.initialize()
                 tools = await client.list_tools()
