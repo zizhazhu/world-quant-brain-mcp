@@ -1419,6 +1419,7 @@ class BrainApiClient:
             self.redis_client = redis.Redis(
                 host=redis_host,
                 port=redis_port,
+                password=os.environ.get('REDIS_PASSWORD') or None,
                 db=0,
                 decode_responses=True,
                 socket_connect_timeout=5

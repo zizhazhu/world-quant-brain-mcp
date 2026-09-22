@@ -214,6 +214,15 @@ python main.py
 | `FORUM_MAX_CONCURRENCY` | | 论坛并发，默认 `1` |
 | `FORUM_RATE_LIMIT_SECONDS` | | 论坛调用间隔，默认 `0` |
 | `REDIS_HOST` / `REDIS_PORT` | | Redis 地址，Docker 模式自动为 `redis:6379` |
+| `REDIS_PASSWORD` | | Redis 密码，可选；未设置或留空时不使用密码认证 |
+
+连接已启用密码认证的 Redis 时，在 `.env` 中设置：
+
+```dotenv
+REDIS_PASSWORD='your-redis-password'
+```
+
+密码按原值传递；含空格、`#` 或 `$` 等字符时请使用引号（例如上面的单引号），避免 `.env` 解析改变其内容。该配置仅用于客户端认证，不会为 Docker Compose 附带的 Redis 服务设置密码。认证失败时沿用现有 Redis 连接失败的降级行为。
 
 ### 流量与并发调优
 
