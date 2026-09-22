@@ -6,10 +6,44 @@ WorldQuant BRAIN 平台的 MCP（Model Context Protocol）服务端，通过 Str
 - 传输协议：Streamable HTTP
 - 依赖服务：Redis（用于缓存与并发锁）
 
+## GitHub Actions 镜像构建
+
+推送 `main` 会触发 **Build and publish image**；也可在 GitHub 的 **Actions** 页面手动运行。
+其他分支的手动运行仅构建和验证，不发布。构建在 GitHub 的 `ubuntu-24.04` Runner 上完成，
+不需要启动本地 Docker，不需要配置 BRAIN 凭据或额外的 GHCR 推送 Token。
+仓库需允许 Actions 运行及工作流声明的 `packages: write` 权限。
+
+工作流使用现有 Dockerfile 构建 `linux/amd64` 镜像，通过 build arguments 使用 Debian 和 PyPI
+官方源，清空 `PLAYWRIGHT_DOWNLOAD_HOST` 以使用浏览器官方 CDN，并缓存构建层。
+发布前检查 Python 依赖、镜像内容、Playwright 自带 Chromium 启动、默认服务入口、
+`/health` 及 MCP 初始化和工具列表。测试容器没有外部网络，也不调用业务工具。
+这验证镜像的基础运行能力，不代表已验证账号认证、Redis 或真实平台操作。
+
+验证通过后，同一镜像推送到以下两个标签：
+
+```text
+ghcr.io/zizhazhu/world-quant-brain-mcp:latest
+ghcr.io/zizhazhu/world-quant-brain-mcp:sha-<完整提交SHA>
+```
+
+工作流按当前仓库名自动生成镜像地址；其他 Fork 使用自己的账号路径。
+`latest` 用于日常使用，SHA 标签用于定位版本或回滚；重新构建同一提交时依赖可能更新，
+需要精确复现已发布镜像时使用运行摘要中的 digest。
+首次发布会自动创建 GHCR 包，默认私有，本工作流不改变可见性。
+公开仓库的 Actions 日志和摘要可公开查看，因此不得向构建传入账号密码。
+
+发布串行执行，过期的 `main` 提交不会发布。失败时查看对应 Actions 步骤和容器日志；
+依赖或启动检查失败会阻止发布，GHCR 拒绝推送时检查包的仓库关联和写入权限。
+成功后可在 GitHub **Packages** 查看镜像，运行摘要包含两个标签和 digest。
+
+更新 `latest` **不会自动重启 k3s 中已有的 Pod**；部署更新和私有镜像拉取凭据需要单独配置。
+本工作流不操作 k3s，也不修改 Redis 接入方式。
+
 ---
 
 ## 目录
 
+- [GitHub Actions 镜像构建](#github-actions-镜像构建)
 - [一、Docker 安装（推荐）](#一docker-安装推荐)
 - [二、Python 安装（Ubuntu / Windows）](#二python-安装ubuntu--windows)
 - [三、环境变量配置](#三环境变量配置)

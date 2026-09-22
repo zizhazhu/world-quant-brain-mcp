@@ -1,0 +1,106 @@
+name: Build and publish image
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+# Serialize publication so an older build cannot overwrite a newer latest tag.
+concurrency:
+  group: container-image-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      LOCAL_IMAGE: brain-mcp:ci
+      TEST_CONTAINER: brain-mcp-smoke
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build and load image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ${{ env.LOCAL_IMAGE }}
+          build-args: |
+            APT_MIRROR=deb.debian.org
+            PIP_INDEX_URL=https://pypi.org/simple
+            PLAYWRIGHT_DOWNLOAD_HOST=
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Check dependencies and image contents
+        run: |
+          docker run --rm --network none "$LOCAL_IMAGE" python -m pip check
+          docker run --rm --network none --shm-size=1g "$LOCAL_IMAGE" python scripts/ci_image_smoke.py image
+
+      - name: Check default startup and MCP protocol
+        run: |
+          docker run -d --name "$TEST_CONTAINER" --network none --shm-size=1g "$LOCAL_IMAGE"
+          timeout 150s docker exec "$TEST_CONTAINER" python scripts/ci_image_smoke.py runtime
+
+      - name: Show logs and clean up
+        if: always()
+        run: |
+          if docker container inspect "$TEST_CONTAINER" >/dev/null 2>&1; then
+            docker logs "$TEST_CONTAINER"
+            docker rm -f "$TEST_CONTAINER"
+          fi
+
+      - name: Check publication eligibility
+        id: publish
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          head_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')
+          if [ "$head_sha" != "$GITHUB_SHA" ]; then
+            echo 'Skipping publication: main has a newer commit.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo 'enabled=true' >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        if: steps.publish.outputs.enabled == 'true'
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish tested image
+        if: steps.publish.outputs.enabled == 'true'
+        env:
+          IMAGE: ${{ steps.publish.outputs.image }}
+        run: |
+          docker tag "$LOCAL_IMAGE" "$IMAGE:sha-$GITHUB_SHA"
+          docker tag "$LOCAL_IMAGE" "$IMAGE:latest"
+          docker push "$IMAGE:sha-$GITHUB_SHA"
+          docker push "$IMAGE:latest"
+          digest=$(docker image inspect "$LOCAL_IMAGE" --format '{{index .RepoDigests 0}}')
+          {
+            echo '### Published image'
+            echo "- Latest: \`$IMAGE:latest\`"
+            echo "- Revision: \`$IMAGE:sha-$GITHUB_SHA\`"
+            echo "- Digest: \`$digest\`"
+          } >> "$GITHUB_STEP_SUMMARY"
