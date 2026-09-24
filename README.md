@@ -402,9 +402,34 @@ SUPER 专用的 `selection_handling` / `selection_limit` / `component_activation
 
 `get_platform_setting_options` 现在会一并返回 `simulation_types`，所以 `ALL` 这个地区对应哪种 type 是可发现的，不用猜。
 
+### 快速模拟（QUICK / FULL）
+
+平台在 `OPTIONS /simulations` 的 `settings.simulationMode` 上提供 `FULL`（默认）和 `QUICK` 两档。本服务把它暴露为三个写路径共用的 `simulation_mode` 参数，取值大小写不敏感；非法值在发出请求前就被本地拒绝。
+
+`FULL` 是平台默认值：请求里**不发送** `settings.simulationMode`，因此历史请求体与账本指纹保持完全一致。只有 `QUICK` 会写成 `simulationMode: "QUICK"`。在单次 `create_simulation` 的账本中，两种模式的指纹不同，不会互相复用（新行会写明 `simulation_mode`）。
+
+单个：
+
+```python
+create_simulation(
+    alpha_expression="rank(-returns)",
+    region="USA", universe="TOP3000",
+    simulation_mode="QUICK",
+)
+```
+
+批量（两个批处理入口都接受同一参数）：
+
+```python
+create_multi_simulation(["rank(-returns)", "rank(volume)"], simulation_mode="quick")
+submit_multi_simulation(["rank(-returns)", "rank(volume)"], simulation_mode="QUICK")
+```
+
+`get_platform_setting_options` 现在额外返回 `simulation_modes`，直接从平台 OPTIONS 读出这两档；缺这个键的旧缓存会被判为 miss 并重新拉取。
+
 ### 模拟账本（回测去重）
 
-所有回测都经过本服务，所以每次完成的模拟都会记录到 `cache/simulations/ledger.jsonl`——表达式、settings、alpha_id、IS 指标。带来两件事：
+通过 `create_simulation` 完成的单次回测会记录到 `cache/simulations/ledger.jsonl`——表达式、settings、alpha_id、IS 指标。带来两件事：
 
 **同一个请求不会付第二次钱。** `create_simulation` 按 (type + settings + 表达式) 的指纹查账本，命中就直接返回当时的 alpha（响应带 `from_local_ledger: true` 和 `previously_simulated_at`），实测 **1ms** 对比一次真实回测的数分钟。改动任一参数（如 decay 4→99）会正确 miss 并走真实模拟。
 

@@ -33,7 +33,7 @@ import pandas as pd
 import zlib
 import msgpack
 from mcp.server.mcpserver import MCPServer
-from pydantic import BaseModel, Field, EmailStr, model_validator
+from pydantic import BaseModel, Field, EmailStr, field_validator, model_validator
 
 # Import the new forum client
 from forum_functions import forum_client
@@ -57,6 +57,29 @@ class AuthCredentials(BaseModel):
 # Source: OPTIONS /simulations -> settings.universe.choices.instrumentType.EQUITY.region.ALL
 _REGION_AGNOSTIC_UNIVERSES = {"LARGE", "MEDIUM", "SMALL"}
 
+# Simulation modes published by OPTIONS /simulations (settings.simulationMode).
+# FULL is the platform default and is omitted from request settings so payloads
+# (and their ledger fingerprints) written before QUICK existed stay identical.
+_SIMULATION_MODES = ("FULL", "QUICK")
+
+
+def _normalize_simulation_mode(simulation_mode: Optional[str]) -> Optional[str]:
+    """Return the value to put in ``settings.simulationMode``, or ``None``.
+
+    FULL means "platform default": the key is dropped from the request. QUICK is
+    sent verbatim. Anything else is rejected here, before any network call.
+    """
+    if simulation_mode is None:
+        return None
+    mode = str(simulation_mode).strip().upper()
+    if mode == "FULL":
+        return None
+    if mode == "QUICK":
+        return "QUICK"
+    raise ValueError(
+        f'simulation_mode must be one of {list(_SIMULATION_MODES)}; got "{simulation_mode}"'
+    )
+
 
 class SimulationSettings(BaseModel):
     instrumentType: str = "EQUITY"
@@ -77,6 +100,12 @@ class SimulationSettings(BaseModel):
     selectionLimit: int = 1000
     maxTrade: str = "OFF"
     componentActivation: str = "IS"
+    simulationMode: Optional[str] = None
+
+    @field_validator("simulationMode", mode="before")
+    @classmethod
+    def _validate_simulation_mode(cls, value: Optional[str]) -> Optional[str]:
+        return _normalize_simulation_mode(value)
 
 class SimulationData(BaseModel):
     type: str = "REGULAR"  # "REGULAR" or "SUPER"
@@ -2616,6 +2645,10 @@ class BrainApiClient:
             'expression': payload.get('regular') or payload.get('combo'),
             'selection': payload.get('selection'),
             'settings': settings,
+            # QUICK requests carry settings.simulationMode; FULL is omitted from the
+            # payload (and so from the fingerprint), so the row records the default
+            # explicitly to keep the ledger self-describing.
+            'simulation_mode': settings.get('simulationMode') or 'FULL',
             'region': settings.get('region'),
             'universe': settings.get('universe'),
             'delay': settings.get('delay'),
@@ -6890,8 +6923,10 @@ class BrainApiClient:
             # Try to get from cache. An entry cached before REGION_AGNOSTIC
             # existed carries no simulation_types key, and would keep hiding the
             # all-region option for the rest of the long TTL, so treat it as a miss.
+            # simulation_modes is the same: a pre-QUICK entry must be refreshed so
+            # callers can discover the new writable setting.
             cached_data = self._get_cached_data(cache_key)
-            if cached_data and 'simulation_types' in cached_data:
+            if cached_data and 'simulation_types' in cached_data and 'simulation_modes' in cached_data:
                 return {**cached_data, 'from_cache': True}
             
             # Use OPTIONS method on simulations endpoint to get configuration options
@@ -6911,11 +6946,19 @@ class BrainApiClient:
             universe_data = {}
             delay_data = {}
             neutralization_data = {}
+            simulation_modes = []
             
             # Parse each setting type
             for key, setting in settings_options.items():
                 if setting['type'] == 'choice':
-                    if setting['label'] == 'Instrument type':
+                    if key == 'simulationMode':
+                        # settings.children.simulationMode (optional, writable,
+                        # choices FULL/QUICK, default FULL).
+                        simulation_modes = [
+                            c['value'] if isinstance(c, dict) else c
+                            for c in (setting.get('choices') or [])
+                        ]
+                    elif setting['label'] == 'Instrument type':
                         instrument_type_data = setting['choices']
                     elif setting['label'] == 'Region':
                         region_data = setting['choices']['instrumentType']
@@ -6954,6 +6997,7 @@ class BrainApiClient:
                 # sees ALL and has no way to know which type unlocks it.
                 'simulation_types': simulation_types,
                 'region_agnostic_type': 'REGION_AGNOSTIC' if 'REGION_AGNOSTIC' in simulation_types else None,
+                'simulation_modes': simulation_modes,
                 'instrument_types': [item['value'] for item in instrument_type_data],
                 'regions_by_type': {
                     item['value']: [r['value'] for r in region_data[item['value']]]
@@ -7829,6 +7873,7 @@ async def create_simulation(
     selection_limit: int = 1000,
     component_activation: str = "IS",
     reuse_existing: bool = True,
+    simulation_mode: str = "FULL",
 ) -> Dict[str, Any]:
     """
     Create a new simulation on BRAIN platform.
@@ -7851,6 +7896,12 @@ async def create_simulation(
     delay is accepted for this type, and the SUPER-only settings
     (selection_handling, selection_limit, component_activation) must not be sent
     — this tool drops them for you.
+
+    SIMULATION MODE: pass simulation_mode="QUICK" for the platform's quick
+    backtest, or leave it at the default "FULL". FULL is the platform default
+    and is omitted from the request, so payloads and ledger fingerprints are
+    unchanged. Case-insensitive; any other value is rejected before the request
+    is sent.
 
     Args:
         type: Simulation type ("REGULAR", "SUPER" or "REGION_AGNOSTIC")
@@ -7895,6 +7946,7 @@ async def create_simulation(
             "selectionHandling": selection_handling,
             "selectionLimit": selection_limit,
             "componentActivation": component_activation,
+            "simulationMode": simulation_mode,
         }
 
         if normalized_language == "PYTHON":
@@ -9194,7 +9246,8 @@ async def create_multi_simulation(
     lookback: Optional[int] = None,
     visualization: bool = False,
     pasteurization: str = "ON",
-    max_trade: str = "OFF"
+    max_trade: str = "OFF",
+    simulation_mode: str = "FULL",
 ) -> Dict[str, Any]:
     """
     🚀 Create multiple regular alpha simulations on BRAIN platform in a single request.
@@ -9209,6 +9262,10 @@ async def create_multi_simulation(
     universe LARGE/MEDIUM/SMALL and delay=1 to batch the "RA Parent" alphas the
     All Region Competition scores. Each expression then yields one RA_PARENT
     alpha plus its per-region RA_CHILD alphas.
+
+    SIMULATION MODE: pass simulation_mode="QUICK" (case-insensitive) to run the
+    batch on the platform's quick backtest; FULL (default) is omitted from the
+    request so existing payloads are unchanged.
 
     Args:
         alpha_expressions: List of alpha expressions/code strings (2-10 expressions required)
@@ -9234,6 +9291,7 @@ async def create_multi_simulation(
     """
     try:
         # Validate input
+        normalized_mode = _normalize_simulation_mode(simulation_mode)
         if len(alpha_expressions) < 2:
             return {"error": "At least 2 alpha expressions are required"}
         if len(alpha_expressions) > 10:
@@ -9275,6 +9333,8 @@ async def create_multi_simulation(
                 'testPeriod': test_period,
                 'maxTrade': max_trade
             }
+            if normalized_mode:
+                settings['simulationMode'] = normalized_mode
 
             if normalized_language == "PYTHON":
                 settings['lookback'] = 256 if lookback is None else lookback
@@ -9438,8 +9498,10 @@ async def _wait_for_multisimulation_completion(location: str, expected_children:
 def _build_multisim_payload(alpha_expressions, instrument_type, region, universe,
                             delay, decay, neutralization, truncation, test_period,
                             unit_handling, nan_handling, language, lookback,
-                            visualization, pasteurization, max_trade):
+                            visualization, pasteurization, max_trade,
+                            simulation_mode="FULL"):
     normalized_language = language.upper()
+    normalized_mode = _normalize_simulation_mode(simulation_mode)
     payload = []
     for alpha_expr in alpha_expressions:
         settings = {
@@ -9456,6 +9518,8 @@ def _build_multisim_payload(alpha_expressions, instrument_type, region, universe
             'testPeriod': test_period,
             'maxTrade': max_trade
         }
+        if normalized_mode:
+            settings['simulationMode'] = normalized_mode
         if normalized_language == "PYTHON":
             settings['lookback'] = 256 if lookback is None else lookback
         else:
@@ -9483,25 +9547,28 @@ async def submit_multi_simulation(
     lookback: Optional[int] = None,
     visualization: bool = False,
     pasteurization: str = "ON",
-    max_trade: str = "OFF"
+    max_trade: str = "OFF",
+    simulation_mode: str = "FULL",
 ) -> Dict[str, Any]:
     """Stage 1/3: submit a multisimulation and return IMMEDIATELY (seconds).
 
     Returns {submitted, location, multisimulation_id} on success. On HTTP 429
     returns {error: "RATE_LIMITED", retry_after}. Poll the location with
     check_multi_simulation, then call fetch_multi_simulation_result.
-    Same parameters as create_multi_simulation.
+    Same parameters as create_multi_simulation, including simulation_mode=QUICK.
     """
     try:
         if len(alpha_expressions) < 2:
             return {"error": "At least 2 alpha expressions are required"}
         if len(alpha_expressions) > 10:
             return {"error": "Maximum 10 alpha expressions allowed per request"}
+        normalized_mode = _normalize_simulation_mode(simulation_mode)
         await brain_client.ensure_authenticated()
         payload = _build_multisim_payload(
             alpha_expressions, instrument_type, region, universe, delay, decay,
             neutralization, truncation, test_period, unit_handling, nan_handling,
-            language, lookback, visualization, pasteurization, max_trade)
+            language, lookback, visualization, pasteurization, max_trade,
+            normalized_mode)
         response = await brain_client._request(
             'POST', f"{brain_client.base_url}/simulations", json=payload)
         if response.status_code == 429:
