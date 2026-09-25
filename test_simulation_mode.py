@@ -267,6 +267,152 @@ async def verify_fingerprint_and_ledger():
     check("ledger rows record QUICK and FULL explicitly", modes == ["QUICK", "FULL"], modes)
 
 
+_MULTI_PATCHED = ('_request', 'ensure_authenticated', 'get_alpha_details',
+                  'record_alpha_locally', '_resolve_ra_children', 'store')
+
+
+def _patch_multi_client(handler):
+    """Aim the real brain_client at a fake transport and a fresh store root."""
+    client = main.brain_client
+    saved = {name: getattr(client, name) for name in _MULTI_PATCHED}
+    client.store = main.PersistentStore(
+        Path(tempfile.mkdtemp(prefix="brain-multi-ledger-")), client.log)
+
+    async def _auth():
+        pass
+
+    async def _details(alpha_id, force_refresh=False):
+        return {"id": alpha_id, "is": {"sharpe": 1.5}, "type": "REGULAR"}
+
+    async def _record(alpha):
+        pass
+
+    async def _no_children(alpha):
+        return None
+
+    client._request = handler
+    client.ensure_authenticated = _auth
+    client.get_alpha_details = _details
+    client.record_alpha_locally = _record
+    client._resolve_ra_children = _no_children
+    return client, saved
+
+
+def _restore_multi_client(client, saved):
+    for name, value in saved.items():
+        setattr(client, name, value)
+
+
+async def _single_payload(**kwargs):
+    """The exact payload create_simulation sends, captured at the transport."""
+    captured = []
+
+    async def handler(method, url, **kw):
+        captured.append(kw.get("json"))
+        return FakeResponse(status_code=400, payload={"detail": "stop"})
+
+    client, saved = _patch_multi_client(handler)
+    try:
+        await main.create_simulation(reuse_existing=False, **kwargs)
+    finally:
+        _restore_multi_client(client, saved)
+    return captured[-1]
+
+
+async def verify_multi_ledger_fingerprint():
+    print("\n[7] multisim items fingerprint like the equivalent single request")
+    fp = main.BrainApiClient._simulation_fingerprint
+    canon = main.BrainApiClient._ledger_payload
+    shared = dict(region="USA", universe="TOP3000", delay=1, decay=4,
+                  neutralization="INDUSTRY", truncation=0.0, test_period="P0Y0M",
+                  unit_handling="VERIFY", nan_handling="OFF", pasteurization="ON",
+                  max_trade="OFF")
+    for language in ("FASTEXPR", "PYTHON"):
+        for mode in ("FULL", "QUICK"):
+            single = await _single_payload(alpha_expression="rank(-returns)",
+                                           language=language, simulation_mode=mode, **shared)
+            item = main._build_multisim_payload(
+                ["rank(-returns)", "rank(volume)"], "EQUITY", "USA", "TOP3000", 1, 4,
+                "INDUSTRY", 0.0, "P0Y0M", "VERIFY", "OFF", language, None, False, "ON", "OFF",
+                simulation_mode=mode)[0]
+            check(f"{language}/{mode}: multi item fingerprint == single fingerprint",
+                  fp(canon(item)) == fp(single), (canon(item), single))
+            check(f"{language}/{mode}: canonicalising a single payload changes nothing",
+                  fp(canon(single)) == fp(single), (canon(single), single))
+
+
+def _multisim_handler(expressions, child_status="COMPLETE"):
+    base = "https://example.invalid"
+
+    async def handler(method, url, **kwargs):
+        if method == "POST":
+            return FakeResponse(201, headers={"Location": f"{base}/simulations/MS1"})
+        if url.endswith("/simulations/MS1"):
+            return FakeResponse(200, payload={
+                "status": "COMPLETE",
+                "children": [f"C{i}" for i in range(len(expressions))]})
+        idx = int(url.rsplit("/C", 1)[-1])
+        return FakeResponse(200, payload={
+            "status": child_status, "alpha": f"A{idx}", "type": "REGULAR",
+            "regular": expressions[idx],
+            "settings": {"region": "USA", "universe": "TOP3000", "delay": 1, "decay": 4}})
+    return handler
+
+
+async def verify_multi_ledger_recording():
+    print("\n[8] multisim results land in the simulation ledger")
+    expressions = ["rank(-returns)", "rank(volume)"]
+    location = "https://example.invalid/simulations/MS1"
+
+    client, saved = _patch_multi_client(_multisim_handler(expressions))
+    try:
+        submitted = await main.submit_multi_simulation(expressions)
+        check("submit succeeds", submitted.get("submitted") is True, submitted)
+        stored = await client.store.get("multisim_request", "MS1")
+        check("submitted request is stored under the multisim id",
+              stored and len(stored.get("items") or []) == 2, stored)
+
+        await main.fetch_multi_simulation_result(location)
+        rows = await client.read_simulation_ledger()
+        check("one ledger row per child", len(rows) == 2, rows)
+        check("rows carry the right expression and alpha id",
+              {(r["expression"], r["alpha_id"]) for r in rows} ==
+              {("rank(-returns)", "A0"), ("rank(volume)", "A1")}, rows)
+        item = main._build_multisim_payload(
+            expressions, "EQUITY", "USA", "TOP3000", 1, 4, "INDUSTRY", 0.0, "P0Y0M",
+            "VERIFY", "OFF", "FASTEXPR", None, False, "ON", "OFF")[0]
+        fingerprint = main.BrainApiClient._simulation_fingerprint(
+            main.BrainApiClient._ledger_payload(item))
+        prior = await client._ledger_lookup(fingerprint)
+        check("single-path lookup finds the multisim alpha",
+              prior and prior.get("alpha_id") == "A0", prior)
+
+        await main.fetch_multi_simulation_result(location)
+        rows = await client.read_simulation_ledger()
+        check("re-fetching adds no duplicate rows", len(rows) == 2, rows)
+    finally:
+        _restore_multi_client(client, saved)
+
+    client, saved = _patch_multi_client(_multisim_handler(expressions))
+    try:
+        result = await main.create_multi_simulation(expressions)
+        check("create_multi succeeds", result.get("success") is True, result)
+        rows = await client.read_simulation_ledger()
+        check("create_multi records every child", len(rows) == 2, rows)
+    finally:
+        _restore_multi_client(client, saved)
+
+    client, saved = _patch_multi_client(_multisim_handler(expressions))
+    try:
+        await main.fetch_multi_simulation_result(location)
+        rows = await client.read_simulation_ledger()
+        check("without a stored request, children are rebuilt from the child GET",
+              {(r["expression"], r["alpha_id"]) for r in rows} ==
+              {("rank(-returns)", "A0"), ("rank(volume)", "A1")}, rows)
+    finally:
+        _restore_multi_client(client, saved)
+
+
 class _OptionsResponse:
     def __init__(self, payload):
         self._payload = payload
@@ -355,6 +501,8 @@ async def _run():
     await verify_multi_entry_points()
     await verify_fingerprint_and_ledger()
     await verify_options_cache()
+    await verify_multi_ledger_fingerprint()
+    await verify_multi_ledger_recording()
 
 
 if __name__ == "__main__":

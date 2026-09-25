@@ -2678,6 +2678,75 @@ class BrainApiClient:
         except Exception as e:
             self.log(f"[ledger] Failed to record simulation {alpha.get('id')}: {e}", "WARNING")
 
+    @staticmethod
+    def _ledger_payload(item: Dict[str, Any]) -> Dict[str, Any]:
+        """Canonical request shape for fingerprinting, as create_simulation builds it.
+
+        Multisimulation items are raw dicts (``decay`` stays an int) while the
+        single path goes through SimulationSettings (``decay`` becomes a float),
+        so the same request hashed to two fingerprints. Only keys the item
+        actually carries are kept, so model defaults never leak in (a PYTHON item
+        has no unitHandling, and neither does the single PYTHON payload).
+        """
+        sim_type = item.get('type') or 'REGULAR'
+        settings = SimulationSettings(**(item.get('settings') or {})).model_dump(exclude_unset=True)
+        if str(sim_type).upper() != "SUPER":
+            for key in ('selectionHandling', 'selectionLimit', 'componentActivation'):
+                settings.pop(key, None)
+        payload = {
+            'type': sim_type,
+            'settings': {k: v for k, v in settings.items() if v is not None},
+            'regular': item.get('regular'),
+            'combo': item.get('combo'),
+            'selection': item.get('selection'),
+        }
+        return {k: v for k, v in payload.items() if v is not None}
+
+    async def _ledger_record_once(self, fingerprint: str, payload: Dict[str, Any],
+                                  alpha: Dict[str, Any]) -> None:
+        """_ledger_record, skipped when this exact alpha is already recorded.
+
+        A multisimulation result can be fetched any number of times; without
+        this every fetch would append the same rows to the JSONL again.
+        """
+        prior = await self._ledger_lookup(fingerprint)
+        if prior and prior.get('alpha_id') == alpha.get('id'):
+            return
+        await self._ledger_record(fingerprint, payload, alpha)
+
+    async def record_multisim_child(self, location: str, index: int,
+                                    child_sim: Dict[str, Any], alpha: Dict[str, Any]) -> None:
+        """Record one multisimulation child in the ledger. Never raises."""
+        try:
+            multisim_id = str(location or '').rstrip('/').split('/')[-1]
+            stored = await self.store.get('multisim_request', multisim_id) if multisim_id else None
+            items = [i for i in ((stored or {}).get('items') or []) if isinstance(i, dict)]
+            child_expr = child_sim.get('regular')
+            if isinstance(child_expr, dict):
+                child_expr = child_expr.get('code')
+            item = None
+            if items:
+                if child_expr:
+                    matches = [i for i in items if i.get('regular') == child_expr]
+                    if 0 <= index < len(items) and items[index] in matches:
+                        item = items[index]
+                    elif matches:
+                        item = matches[0]
+                elif 0 <= index < len(items):
+                    item = items[index]
+            if item is None:
+                # Submitted before requests were stored (or by another client):
+                # the child simulation echoes its own type, settings and code.
+                if not child_expr:
+                    return
+                item = {'type': child_sim.get('type') or 'REGULAR',
+                        'settings': child_sim.get('settings') or {},
+                        'regular': child_expr}
+            payload = self._ledger_payload(item)
+            await self._ledger_record_once(self._simulation_fingerprint(payload), payload, alpha)
+        except Exception as e:
+            self.log(f"[ledger] Failed to record multisim child {alpha.get('id')}: {e}", "WARNING")
+
     async def read_simulation_ledger(self) -> List[Dict[str, Any]]:
         """All recorded simulations, newest first (append-only JSONL)."""
         path = self._ledger_path()
@@ -2788,6 +2857,15 @@ class BrainApiClient:
         change the submission path in any way.
         """
         response = await self._request('POST', f"{self.base_url}/simulations", json=payload)
+        if isinstance(payload, list) and response.status_code == 201 and response.headers.get('Location'):
+            # fetch_multi_simulation_result only gets the location back, so keep
+            # the request to key each child's ledger entry.
+            try:
+                multisim_id = self._to_absolute_url(
+                    response.headers.get('Location')).rstrip('/').split('/')[-1]
+                await self.store.put('multisim_request', multisim_id, {'items': payload})
+            except Exception as e:
+                self.log(f"[ledger] Failed to store multisim request: {e}", "WARNING")
         try:
             items = payload if isinstance(payload, list) else [payload]
             first = items[0] if items and isinstance(items[0], dict) else {}
@@ -9674,6 +9752,7 @@ async def _wait_for_multisimulation_completion(location: str, expected_children:
                         try:
                             child_alpha = await brain_client.get_alpha_details(alpha_id)
                             await brain_client.record_alpha_locally(child_alpha)
+                            await brain_client.record_multisim_child(location, i, alpha_data, child_alpha)
                             alpha_results.append({
                                 'alpha_id': alpha_id,
                                 'location': child_url,
@@ -9901,6 +9980,7 @@ async def fetch_multi_simulation_result(location: str) -> Dict[str, Any]:
                     return {"alpha_id": alpha_id, "location": child_url,
                             "error": f"Failed to get alpha details: {e}"}
                 await brain_client.record_alpha_locally(details)
+                await brain_client.record_multisim_child(location, i, child, details)
                 return {"alpha_id": alpha_id, "location": child_url, "details": details}
             except Exception as e:
                 return {"location": f"child_{i+1}", "error": str(e)}
