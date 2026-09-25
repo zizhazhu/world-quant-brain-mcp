@@ -107,6 +107,9 @@ class FakeMultiClient:
         self.requests.append((method, url, kwargs.get("json")))
         return FakeResponse(status_code=201, headers={"Location": f"{self.base_url}/simulations/42"})
 
+    async def _post_simulation(self, payload, *, tool):
+        return await self._request('POST', f"{self.base_url}/simulations", json=payload)
+
 
 async def _fake_wait_for_multisim(location, expected_children):
     return {"success": True, "alpha_results": []}

@@ -437,6 +437,14 @@ submit_multi_simulation(["rank(-returns)", "rank(volume)"], simulation_mode="QUI
 
 **自己的研究历史可本地检索。** `search_my_simulations(region=, universe=, contains=, min_sharpe=, sort=)` 直接查账本，零平台请求——不必再去分页 `/users/self/alphas`（每行约 50ms/4KB，且限流 30 次/分）。
 
+### 在途模拟（in-flight simulations）
+
+平台没有列出在途模拟的接口（`GET /simulations` 返回 405），所以本服务只记录**自己提交过**的模拟：每次 `POST /simulations` 拿到 201 后，把 id、location、提交时间、调用工具、type/region/universe/mode、子模拟数等不变事实写入 `cache/simulations/inflight.json`（临时文件 + `os.replace` 原子写，全部读写由单把锁串行化）。
+
+`get_inflight_simulations()` 在查询时才对每个记录的 location 各发一次 GET 拿实时状态——**状态从不落盘**。条目只在平台明确说结束时才移除：`200 + Retry-After > 0` 算仍在运行（附 `status`/`progress`）；`200 无 Retry-After` 算完成并移除；`404` 按 `NOT_FOUND` 移除；其他状态或网络异常则保留并标 `check: "unchecked: ..."`。
+
+计数按 `category` 分桶（`glb` / `region_agnostic` / `other`），因为 GLB 与 Region-Agnostic 在平台上有各自独立的并发上限。提交被 429 拒绝时会记录 `last_rejection`（含当时后台快照的 `inflight_counts_then`），由调用方与当前 counts 对比自行判断（服务端不计算上限或空位）；网页端或其他脚本提交的模拟不可见。此功能只观察——**不阻塞、不排队、不重试、不取消任何提交**。
+
 ### 论坛
 
 | | 首次 | 二次 |

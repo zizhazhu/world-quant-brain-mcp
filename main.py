@@ -1375,6 +1375,13 @@ class BrainApiClient:
             self._submit_max_seconds = max(300.0, float(os.environ.get("BRAIN_SUBMIT_MAX_SECONDS", "5400")))
         except Exception:
             self._submit_max_seconds = 5400.0
+        # In-flight simulation tracking is purely observational: a JSON file
+        # next to the ledger records what THIS server submitted (immutable
+        # facts only), and live status is probed at query time — never cached.
+        # One lock guards every read-modify-write; background snapshot tasks
+        # are kept in a set so they are not garbage-collected mid-flight.
+        self._inflight_lock = asyncio.Lock()
+        self._inflight_tasks: set = set()
         # Permanent on-disk store for immutable platform data. Redis stays the
         # hot tier for things that actually change (alpha lists, pyramid stats).
         store_root = os.environ.get("BRAIN_CACHE_DIR") or str(Path(__file__).parent / "cache")
@@ -2497,7 +2504,7 @@ class BrainApiClient:
                                             '(e.g. after a monthly data release).'),
                         }
 
-            response = await self._request('POST', f"{self.base_url}/simulations", json=payload)
+            response = await self._post_simulation(payload, tool='create_simulation')
             if response.status_code >= 400:
                 return {
                     "error": "Failed to create simulation",
@@ -2692,6 +2699,227 @@ class BrainApiClient:
             return rows
 
         return await asyncio.to_thread(_read)
+
+    # --- In-flight simulations -------------------------------------------- #
+    #
+    # BRAIN offers no endpoint listing running simulations (GET /simulations
+    # answers 405), so this file records what THIS server submitted — a small
+    # set of immutable facts written once at submit time — and live status is
+    # probed on every query. Status is never cached, and nothing here blocks,
+    # queues, retries or cancels a submission.
+
+    def _inflight_path(self) -> Path:
+        return self.store.root / 'simulations' / 'inflight.json'
+
+    def _inflight_read_sync(self) -> Dict[str, Any]:
+        """Read inflight.json; a missing or corrupt file reads as empty."""
+        try:
+            data = json.loads(self._inflight_path().read_text(encoding='utf-8'))
+        except Exception:
+            data = None
+        if not isinstance(data, dict):
+            data = {}
+        inflight = data.get('inflight')
+        last_rejection = data.get('last_rejection')
+        return {
+            'inflight': ([e for e in inflight if isinstance(e, dict)]
+                         if isinstance(inflight, list) else []),
+            'last_rejection': last_rejection if isinstance(last_rejection, dict) else None,
+        }
+
+    def _inflight_write_sync(self, data: Dict[str, Any]) -> None:
+        """Atomically replace inflight.json (tmp file + os.replace)."""
+        path = self._inflight_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + '.tmp')
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
+        os.replace(tmp, path)
+
+    @staticmethod
+    def _inflight_category(sim_type: str, region: str) -> str:
+        # GLB and region-agnostic simulations obey separate platform
+        # concurrency limits, so they are never counted together.
+        if sim_type == 'REGION_AGNOSTIC':
+            return 'region_agnostic'
+        if (region or '').upper() == 'GLB':
+            return 'glb'
+        return 'other'
+
+    async def _inflight_add(self, entry: Dict[str, Any]) -> None:
+        async with self._inflight_lock:
+            data = await asyncio.to_thread(self._inflight_read_sync)
+            data['inflight'].append(entry)
+            await asyncio.to_thread(self._inflight_write_sync, data)
+
+    async def _inflight_record_rejection(self, rejection: Dict[str, Any]) -> None:
+        async with self._inflight_lock:
+            data = await asyncio.to_thread(self._inflight_read_sync)
+            data['last_rejection'] = rejection
+            await asyncio.to_thread(self._inflight_write_sync, data)
+        self._schedule_inflight_snapshot(rejection.get('at'))
+
+    def _schedule_inflight_snapshot(self, rejection_at: Optional[float]) -> None:
+        """Snapshot in-flight counts in the background right after a 429."""
+        try:
+            task = asyncio.create_task(self._inflight_rejection_snapshot(rejection_at))
+        except RuntimeError:
+            return
+        self._inflight_tasks.add(task)
+        task.add_done_callback(self._inflight_tasks.discard)
+
+    async def _inflight_rejection_snapshot(self, rejection_at: Optional[float]) -> None:
+        try:
+            result = await self.refresh_inflight()
+            async with self._inflight_lock:
+                data = await asyncio.to_thread(self._inflight_read_sync)
+                rejection = data.get('last_rejection')
+                if isinstance(rejection, dict) and rejection.get('at') == rejection_at:
+                    rejection['inflight_counts_then'] = result.get('counts')
+                    rejection['snapshot_checked_at'] = result.get('checked_at')
+                    await asyncio.to_thread(self._inflight_write_sync, data)
+        except Exception as e:
+            self.log(f"[inflight] Rejection snapshot failed: {e}", "WARNING")
+
+    async def _post_simulation(self, payload, *, tool: str) -> requests.Response:
+        """POST /simulations and record what this server submitted.
+
+        Purely observational: the response is returned untouched, and a
+        recording failure is logged but never raised — tracking must not
+        change the submission path in any way.
+        """
+        response = await self._request('POST', f"{self.base_url}/simulations", json=payload)
+        try:
+            items = payload if isinstance(payload, list) else [payload]
+            first = items[0] if items and isinstance(items[0], dict) else {}
+            settings = first.get('settings') or {}
+            sim_type = str(first.get('type') or '').upper()
+            region = str(settings.get('region') or '')
+            category = self._inflight_category(sim_type, region)
+
+            if response.status_code == 201 and response.headers.get('Location'):
+                location = self._to_absolute_url(response.headers.get('Location'))
+                await self._inflight_add({
+                    'id': location.rstrip('/').split('/')[-1],
+                    'location': location,
+                    'submitted_at': time.time(),
+                    'tool': tool,
+                    'type': sim_type,
+                    'region': settings.get('region'),
+                    'universe': settings.get('universe'),
+                    'mode': settings.get('simulationMode') or 'FULL',
+                    'multi': isinstance(payload, list),
+                    'children': len(items),
+                    'category': category,
+                })
+            elif response.status_code == 429:
+                await self._inflight_record_rejection({
+                    'at': time.time(),
+                    'http_status': response.status_code,
+                    'retry_after': response.headers.get('Retry-After'),
+                    'body': (response.text or '')[:500],
+                    'tool': tool,
+                    'category': category,
+                    'children': len(items),
+                })
+        except Exception as e:
+            self.log(f"[inflight] Failed to record simulation submission: {e}", "WARNING")
+        return response
+
+    async def refresh_inflight(self) -> Dict[str, Any]:
+        """Probe live platform status for every recorded submission.
+
+        Reads the inflight file, GETs each recorded location concurrently
+        (one request per entry, paced by the rate limiter), and removes only
+        the ids the platform reports finished — entries appended while the
+        GETs were in flight survive. Entries whose probe fails are kept and
+        marked ``unchecked``.
+        """
+        async with self._inflight_lock:
+            data = await asyncio.to_thread(self._inflight_read_sync)
+        entries = data['inflight']
+        checked_at = time.time()
+
+        if entries:
+            await self.ensure_authenticated()
+
+        async def _check(entry: Dict[str, Any]) -> Dict[str, Any]:
+            result = {'entry': entry, 'finished': False, 'final_status': None,
+                      'platform_status': None, 'progress': None, 'check': 'ok'}
+            try:
+                response = await self._request('GET', entry['location'])
+                if response.status_code == 200:
+                    try:
+                        wait = float(response.headers.get('Retry-After') or 0)
+                    except (TypeError, ValueError):
+                        wait = 0.0
+                    try:
+                        body = response.json()
+                    except Exception:
+                        body = {}
+                    if not isinstance(body, dict):
+                        body = {}
+                    if wait > 0:
+                        result['platform_status'] = body.get('status')
+                        result['progress'] = body.get('progress')
+                    else:
+                        result['finished'] = True
+                        result['final_status'] = body.get('status') or 'COMPLETE'
+                elif response.status_code == 404:
+                    result['finished'] = True
+                    result['final_status'] = 'NOT_FOUND'
+                else:
+                    result['check'] = f"unchecked: http_{response.status_code}"
+            except Exception as e:
+                result['check'] = f"unchecked: {type(e).__name__}: {e}"
+            return result
+
+        results = (await asyncio.gather(*[_check(e) for e in entries])) if entries else []
+
+        # Re-read under the lock and remove only the ids proven finished, so
+        # entries appended while the GETs were in flight are never dropped.
+        finished_ids = {r['entry'].get('id') for r in results if r['finished']}
+        removed = [{'id': r['entry'].get('id'),
+                    'category': r['entry'].get('category'),
+                    'final_status': r['final_status']}
+                   for r in results if r['finished']]
+        async with self._inflight_lock:
+            data = await asyncio.to_thread(self._inflight_read_sync)
+            if finished_ids:
+                data['inflight'] = [e for e in data['inflight']
+                                    if e.get('id') not in finished_ids]
+                await asyncio.to_thread(self._inflight_write_sync, data)
+            remaining = data['inflight']
+            last_rejection = data['last_rejection']
+
+        results_by_id = {r['entry'].get('id'): r for r in results}
+        counts = {k: {'submissions': 0, 'children': 0}
+                  for k in ('total', 'glb', 'region_agnostic', 'other')}
+        inflight = []
+        now = time.time()
+        for entry in remaining:
+            row = dict(entry)
+            submitted_at = entry.get('submitted_at')
+            row['running_seconds'] = (round(now - submitted_at, 1)
+                                      if isinstance(submitted_at, (int, float)) else None)
+            r = results_by_id.get(entry.get('id'))
+            row['platform_status'] = r['platform_status'] if r else None
+            row['progress'] = r['progress'] if r else None
+            row['check'] = r['check'] if r else 'unchecked: not queried this round'
+            inflight.append(row)
+            cat = entry.get('category') if entry.get('category') in counts else 'other'
+            children = entry.get('children') or 1
+            counts['total']['submissions'] += 1
+            counts['total']['children'] += children
+            counts[cat]['submissions'] += 1
+            counts[cat]['children'] += children
+
+        return {
+            'checked_at': checked_at,
+            'counts': counts,
+            'inflight': inflight,
+            'removed_this_check': removed,
+            'last_rejection': last_rejection,
+        }
 
     async def _cached_get(
         self,
@@ -9350,7 +9578,7 @@ async def create_multi_simulation(
             multisimulation_data.append(simulation_item)
         
         # Send multisimulation request
-        response = await brain_client._request('POST', f"{brain_client.base_url}/simulations", json=multisimulation_data)
+        response = await brain_client._post_simulation(multisimulation_data, tool='create_multi_simulation')
         
         if response.status_code != 201:
             return {
@@ -9569,8 +9797,7 @@ async def submit_multi_simulation(
             neutralization, truncation, test_period, unit_handling, nan_handling,
             language, lookback, visualization, pasteurization, max_trade,
             normalized_mode)
-        response = await brain_client._request(
-            'POST', f"{brain_client.base_url}/simulations", json=payload)
+        response = await brain_client._post_simulation(payload, tool='submit_multi_simulation')
         if response.status_code == 429:
             return {
                 "error": "RATE_LIMITED",
@@ -10433,6 +10660,40 @@ async def search_my_simulations(
         "source": "local simulation ledger (0 platform requests)",
     }
     return out
+
+
+@mcp.tool()
+async def get_inflight_simulations() -> Dict[str, Any]:
+    """Live view of the simulations THIS server has submitted and not yet finished.
+
+    The platform offers no endpoint listing in-flight simulations, so this
+    server records each POST /simulations it makes (id, location, submitted_at,
+    tool, type, region, universe, mode, children, category) and probes every
+    recorded location on each call — status is never cached, and a probe that
+    reports completion (200 without Retry-After, or 404) removes the entry.
+    Costs one GET per in-flight simulation, paced by the rate limiter.
+
+    Entries carry a `category` and `counts` is reported per bucket —
+    `glb`, `region_agnostic` and `other` obey separate platform concurrency
+    limits, so a single total would mislead. To decide whether a new
+    submission fits, compare the current per-category counts against
+    `last_rejection.inflight_counts_then`, the snapshot taken the last time
+    the platform answered 429.
+
+    Purely observational: nothing here blocks, queues, retries or cancels a
+    submission.
+    """
+    try:
+        result = await brain_client.refresh_inflight()
+        result['note'] = (
+            "Only simulations submitted through this server are visible; "
+            "simulations started from the web UI or other scripts are invisible "
+            "and can only be inferred from last_rejection. Counts are per "
+            "category because GLB and Region-Agnostic have separate platform "
+            "limits; no limit or free-slot figure is computed.")
+        return result
+    except Exception as e:
+        return {"error": f"An unexpected error occurred: {str(e)}"}
 
 
 @mcp.tool()
