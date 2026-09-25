@@ -341,7 +341,7 @@ async def verify_multi_ledger_fingerprint():
                   fp(canon(single)) == fp(single), (canon(single), single))
 
 
-def _multisim_handler(expressions, child_status="COMPLETE"):
+def _multisim_handler(expressions, child_status="COMPLETE", alpha_ids=None):
     base = "https://example.invalid"
 
     async def handler(method, url, **kwargs):
@@ -353,7 +353,8 @@ def _multisim_handler(expressions, child_status="COMPLETE"):
                 "children": [f"C{i}" for i in range(len(expressions))]})
         idx = int(url.rsplit("/C", 1)[-1])
         return FakeResponse(200, payload={
-            "status": child_status, "alpha": f"A{idx}", "type": "REGULAR",
+            "status": child_status,
+            "alpha": alpha_ids[idx] if alpha_ids else f"A{idx}", "type": "REGULAR",
             "regular": expressions[idx],
             "settings": {"region": "USA", "universe": "TOP3000", "delay": 1, "decay": 4}})
     return handler
@@ -409,6 +410,20 @@ async def verify_multi_ledger_recording():
         check("without a stored request, children are rebuilt from the child GET",
               {(r["expression"], r["alpha_id"]) for r in rows} ==
               {("rank(-returns)", "A0"), ("rank(volume)", "A1")}, rows)
+    finally:
+        _restore_multi_client(client, saved)
+
+    # The platform answers an identical request with the same alpha id, and
+    # fetch_multi_simulation_result handles children concurrently.
+    dup = ["rank(-returns)", "rank(-returns)", "rank(volume)"]
+    client, saved = _patch_multi_client(_multisim_handler(dup, alpha_ids=["D0", "D0", "D1"]))
+    try:
+        await main.submit_multi_simulation(dup)
+        await main.fetch_multi_simulation_result(location)
+        rows = await client.read_simulation_ledger()
+        check("a duplicated expression in one batch is recorded once",
+              sorted((r["expression"], r["alpha_id"]) for r in rows) ==
+              [("rank(-returns)", "D0"), ("rank(volume)", "D1")], rows)
     finally:
         _restore_multi_client(client, saved)
 

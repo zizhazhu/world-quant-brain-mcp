@@ -1382,6 +1382,7 @@ class BrainApiClient:
         # are kept in a set so they are not garbage-collected mid-flight.
         self._inflight_lock = asyncio.Lock()
         self._inflight_tasks: set = set()
+        self._ledger_lock = asyncio.Lock()
         # Permanent on-disk store for immutable platform data. Redis stays the
         # hot tier for things that actually change (alpha lists, pyramid stats).
         store_root = os.environ.get("BRAIN_CACHE_DIR") or str(Path(__file__).parent / "cache")
@@ -2707,12 +2708,15 @@ class BrainApiClient:
         """_ledger_record, skipped when this exact alpha is already recorded.
 
         A multisimulation result can be fetched any number of times; without
-        this every fetch would append the same rows to the JSONL again.
+        this every fetch would append the same rows to the JSONL again. The lock
+        spans lookup and write: children are fetched concurrently, and a batch
+        holding the same expression twice yields the same alpha id twice.
         """
-        prior = await self._ledger_lookup(fingerprint)
-        if prior and prior.get('alpha_id') == alpha.get('id'):
-            return
-        await self._ledger_record(fingerprint, payload, alpha)
+        async with self._ledger_lock:
+            prior = await self._ledger_lookup(fingerprint)
+            if prior and prior.get('alpha_id') == alpha.get('id'):
+                return
+            await self._ledger_record(fingerprint, payload, alpha)
 
     async def record_multisim_child(self, location: str, index: int,
                                     child_sim: Dict[str, Any], alpha: Dict[str, Any]) -> None:
