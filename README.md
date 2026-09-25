@@ -19,22 +19,23 @@ WorldQuant BRAIN 平台的 MCP（Model Context Protocol）服务端，通过 Str
 `/health` 及 MCP 初始化和工具列表。测试容器没有外部网络，也不调用业务工具。
 这验证镜像的基础运行能力，不代表已验证账号认证、Redis 或真实平台操作。
 
-验证通过后，同一镜像推送到以下两个标签：
+验证通过后，同一镜像推送到以下三个标签：
 
 ```text
 ghcr.io/zizhazhu/world-quant-brain-mcp:latest
+ghcr.io/zizhazhu/world-quant-brain-mcp:main
 ghcr.io/zizhazhu/world-quant-brain-mcp:sha-<完整提交SHA>
 ```
 
 工作流按当前仓库名自动生成镜像地址；其他 Fork 使用自己的账号路径。
-`latest` 用于日常使用，SHA 标签用于定位版本或回滚；重新构建同一提交时依赖可能更新，
+`latest` 和 `main` 均指向主分支最新发布的镜像，SHA 标签用于定位版本或回滚；重新构建同一提交时依赖可能更新，
 需要精确复现已发布镜像时使用运行摘要中的 digest。
 首次发布会自动创建 GHCR 包，默认私有，本工作流不改变可见性。
 公开仓库的 Actions 日志和摘要可公开查看，因此不得向构建传入账号密码。
 
 发布串行执行，过期的 `main` 提交不会发布。失败时查看对应 Actions 步骤和容器日志；
 依赖或启动检查失败会阻止发布，GHCR 拒绝推送时检查包的仓库关联和写入权限。
-成功后可在 GitHub **Packages** 查看镜像，运行摘要包含两个标签和 digest。
+成功后可在 GitHub **Packages** 查看镜像，运行摘要包含三个标签和 digest。
 
 更新 `latest` **不会自动重启 k3s 中已有的 Pod**；部署更新和私有镜像拉取凭据需要单独配置。
 本工作流不操作 k3s，也不修改 Redis 接入方式。

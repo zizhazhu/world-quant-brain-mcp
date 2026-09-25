@@ -9,7 +9,7 @@ permissions:
   contents: read
   packages: write
 
-# Serialize publication so an older build cannot overwrite a newer latest tag.
+# Serialize publication so an older build cannot overwrite newer latest/main tags.
 concurrency:
   group: container-image-${{ github.repository }}
   cancel-in-progress: false
@@ -95,12 +95,15 @@ jobs:
         run: |
           docker tag "$LOCAL_IMAGE" "$IMAGE:sha-$GITHUB_SHA"
           docker tag "$LOCAL_IMAGE" "$IMAGE:latest"
+          docker tag "$LOCAL_IMAGE" "$IMAGE:main"
           docker push "$IMAGE:sha-$GITHUB_SHA"
           docker push "$IMAGE:latest"
+          docker push "$IMAGE:main"
           digest=$(docker image inspect "$LOCAL_IMAGE" --format '{{index .RepoDigests 0}}')
           {
             echo '### Published image'
             echo "- Latest: \`$IMAGE:latest\`"
+            echo "- Main: \`$IMAGE:main\`"
             echo "- Revision: \`$IMAGE:sha-$GITHUB_SHA\`"
             echo "- Digest: \`$digest\`"
           } >> "$GITHUB_STEP_SUMMARY"
