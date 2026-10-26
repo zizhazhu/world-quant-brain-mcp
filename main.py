@@ -62,6 +62,11 @@ _REGION_AGNOSTIC_UNIVERSES = {"LARGE", "MEDIUM", "SMALL"}
 # (and their ledger fingerprints) written before QUICK existed stay identical.
 _SIMULATION_MODES = ("FULL", "QUICK")
 
+_QUICK_MODE_NOTE = (
+    'simulation_mode="QUICK": no visualization and no Theme / Competition / '
+    'correlation checks were run, so this alpha cannot be submitted directly. '
+    'Re-run the same expression with simulation_mode="FULL" before submit_alpha.')
+
 
 def _normalize_simulation_mode(simulation_mode: Optional[str]) -> Optional[str]:
     """Return the value to put in ``settings.simulationMode``, or ``None``.
@@ -106,6 +111,12 @@ class SimulationSettings(BaseModel):
     @classmethod
     def _validate_simulation_mode(cls, value: Optional[str]) -> Optional[str]:
         return _normalize_simulation_mode(value)
+
+    @model_validator(mode="after")
+    def _disable_quick_visualization(self) -> "SimulationSettings":
+        if self.simulationMode == "QUICK":
+            self.visualization = False
+        return self
 
 class SimulationData(BaseModel):
     type: str = "REGULAR"  # "REGULAR" or "SUPER"
@@ -2629,9 +2640,19 @@ class BrainApiClient:
 
     @staticmethod
     def _simulation_fingerprint(payload: Dict[str, Any]) -> str:
-        """Stable hash of a simulation request (type + settings + expression)."""
+        """Stable hash of a simulation request (type + settings + expression).
+
+        ``simulationMode`` was added after the ledger already held rows; FULL
+        is what every earlier request ran as, so it is dropped from the hash
+        and those rows keep matching. QUICK stays in: a QUICK alpha has no
+        checks and must never be replayed for a FULL request.
+        """
+        settings = dict(payload.get('settings') or {})
+        if settings.get('simulationMode', 'FULL') == 'FULL':
+            settings.pop('simulationMode', None)
+        canonical = {**payload, 'settings': settings}
         return hashlib.sha1(
-            json.dumps(payload, sort_keys=True, separators=(',', ':')).encode('utf-8')
+            json.dumps(canonical, sort_keys=True, separators=(',', ':')).encode('utf-8')
         ).hexdigest()
 
     def _ledger_path(self) -> Path:
@@ -3169,11 +3190,16 @@ class BrainApiClient:
                     'region': region,
                     'delay': delay,
                     'universe': universe,
-                    'theme': theme,
                     'limit': limit,
                     'offset': offset
                 }
-                
+                # theme=false is NOT "no filter": it drops every dataset tagged
+                # with a live theme (e.g. "D1 Power Pool Oct`26"), which in
+                # 2026-10 hid 204 of USA/TOP3000's 470 datasets. Only send the
+                # parameter when the caller asks for themed datasets alone.
+                if str(theme).lower() == 'true':
+                    params['theme'] = 'true'
+
                 data = await self._request_json_with_retries(
                     'GET',
                     f"{self.base_url}/data-sets",
@@ -3181,11 +3207,13 @@ class BrainApiClient:
                     op_name=f"get_datasets(offset={offset})",
                 )
                 
-                results = data.get('results', [])
+                results = data.get('results')
+                count = data.get('count')
+                if (not isinstance(results, list) or type(count) is not int or count < 0
+                        or (total_count is not None and count != total_count)):
+                    raise ValueError('Incomplete dataset listing: invalid or changing count/results')
+                total_count = count
                 all_results.extend(results)
-                
-                if total_count is None:
-                    total_count = data.get('count', 0)
                 
                 # Break if we've fetched all data
                 if len(results) < limit or len(all_results) >= total_count:
@@ -3193,10 +3221,19 @@ class BrainApiClient:
                 
                 offset += limit
             
+            ids = [r.get('id') if isinstance(r, dict) else None for r in all_results]
+            if (any(not isinstance(i, str) or not i for i in ids)
+                    or len(set(ids)) != len(ids) or len(ids) != total_count):
+                raise ValueError('Incomplete dataset listing: missing/duplicate IDs or count mismatch')
+            if any(type(r.get('fieldCount')) is not int or r['fieldCount'] < 0
+                   for r in all_results):
+                raise ValueError('Incomplete dataset listing: invalid fieldCount')
+
             # Prepare complete response
             complete_data = {
                 'results': all_results,
                 'count': len(all_results),
+                'complete': True,
                 'extraNote': "if your returned result is 0, you may want to check your parameter by using get_platform_setting_options tool to got correct parameter",
                 'from_cache': False
             }
@@ -3266,9 +3303,10 @@ class BrainApiClient:
             rows = block.get('results') or []
             if data_type and data_type != 'ALL':
                 rows = [f for f in rows if f.get('type') == data_type]
-            out = {'results': rows, 'count': len(rows), 'from_cache': not force_refresh,
+            out = {'results': rows, 'count': len(rows), 'from_cache': block.get('from_cache', False),
                    'dataset_id': dataset_id, 'declared_count': block.get('declared_count'),
-                   'complete': block.get('complete')}
+                   'complete': block.get('complete'), 'defects': block.get('defects') or [],
+                   'cache_updated': block.get('cache_updated', False)}
             if search:
                 ranked = await self._fts_filter(rows, search, region, universe, delay)
                 out['results'] = ranked if ranked is not None else [
@@ -3557,8 +3595,14 @@ class BrainApiClient:
         delay: int = 1,
         universe: str = "TOP3000",
         force_refresh: bool = False,
+        expected_count: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Every datafield of ONE dataset, paged to completion and stored forever.
+
+        ``expected_count`` is the dataset's ``fieldCount`` from a fresh /data-sets
+        listing (verified to equal the /data-fields count). A stored copy whose
+        size differs is stale and gets refetched; so does a fetch whose pages
+        drifted (duplicate ids, or fewer unique ids than the server counted).
 
         This is the only way to see the whole catalogue. A global /data-fields
         sweep is hard-capped: `count` saturates at 10000 and `offset=10000` is
@@ -3575,49 +3619,105 @@ class BrainApiClient:
 
         if not force_refresh:
             stored = await self.store.get('datafields_ds', key)
-            if stored:
-                return stored
+            if (stored and stored.get('complete') is True and not stored.get('defects')
+                    and (expected_count is None or stored.get('count') == expected_count)):
+                rows = stored.get('results') or []
+                ids = [f.get('id') if isinstance(f, dict) else None for f in rows]
+                if (all(isinstance(fid, str) and fid for fid in ids)
+                        and len(set(ids)) == len(ids) == stored.get('count')
+                        and stored.get('declared_count') == len(ids)):
+                    return {**stored, 'cache_updated': False, 'from_cache': True}
 
-        all_results: List[Dict[str, Any]] = []
-        offset, page_size, total = 0, 50, None
-        while True:
-            data = await self._request_json_with_retries(
-                'GET', f"{self.base_url}/data-fields",
-                params={'instrumentType': instrument_type, 'region': region, 'delay': delay,
-                        'universe': universe, 'dataset.id': dataset_id,
-                        'limit': page_size, 'offset': offset},
-                op_name=f"get_dataset_fields({dataset_id}@{offset})",
-            )
-            results = data.get('results') or []
-            if total is None:
-                total = data.get('count')
-            all_results.extend(results)
-            if len(results) < page_size or (total and len(all_results) >= total):
+        async def _sweep(extra: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Optional[int]]:
+            rows: List[Dict[str, Any]] = []
+            offset, page_size, total = 0, 50, None
+            while True:
+                data = await self._request_json_with_retries(
+                    'GET', f"{self.base_url}/data-fields",
+                    params={'instrumentType': instrument_type, 'region': region, 'delay': delay,
+                            'universe': universe, 'dataset.id': dataset_id,
+                            'limit': page_size, 'offset': offset, **extra},
+                    op_name=f"get_dataset_fields({dataset_id}@{offset})",
+                )
+                results = data.get('results')
+                count = data.get('count')
+                if (not isinstance(results, list) or type(count) is not int or count < 0
+                        or any(not isinstance(f, dict) for f in results)
+                        or (total is not None and count != total)):
+                    raise ValueError('Invalid or changing datafield page')
+                if total is None:
+                    total = count
+                rows.extend(results)
+                if len(results) < page_size or (total and len(rows) >= total):
+                    break
+                offset += page_size
+                if offset >= _DATAFIELDS_WINDOW_CAP:
+                    break
+            return rows, total
+
+        async def _fetch() -> Tuple[List[Dict[str, Any]], Optional[int]]:
+            rows, total = await _sweep({})
+            if total and total > _DATAFIELDS_WINDOW_CAP:
+                # The 10000-row window applies within a dataset too; split it by
+                # field type, each slice being under the cap.
+                rows = []
+                for ftype in ('MATRIX', 'VECTOR', 'GROUP', 'UNIVERSE', 'SYMBOL'):
+                    part, _ = await _sweep({'type': ftype})
+                    rows.extend(part)
+            return rows, total
+
+        def _defects(rows: List[Dict[str, Any]], total: Optional[int]) -> List[str]:
+            ids = [f.get('id') for f in rows]
+            valid_ids = [fid for fid in ids if isinstance(fid, str) and fid]
+            unique = set(valid_ids)
+            out = []
+            if len(valid_ids) != len(ids):
+                out.append('missing or invalid field ids')
+            if len(unique) != len(ids):
+                out.append(f'{len(ids) - len(unique)} duplicate ids')
+            if total is not None and len(unique) != total:
+                out.append(f'{len(unique)} unique ids vs server count {total}')
+            if expected_count is not None and total is not None and total != expected_count:
+                out.append(f'server count {total} vs listing fieldCount {expected_count}')
+            return out
+
+        # Paging a live index can shift rows between pages (one id served twice,
+        # another skipped), so a defective sweep is retried before it is kept.
+        for attempt in range(3):
+            try:
+                all_results, total = await _fetch()
+                defects = _defects(all_results, total)
+            except ValueError as e:
+                all_results, total, defects = [], None, [str(e)]
+            if not defects:
                 break
-            offset += page_size
-            if offset >= _DATAFIELDS_WINDOW_CAP:
-                # Same cap applies within a dataset; nothing more is reachable.
-                self.log(f"[catalogue] {dataset_id} exceeds the 10000-row window at "
-                         f"{len(all_results)} fields", "WARNING")
-                break
+            self.log(f"[catalogue] {cfg} {dataset_id} attempt {attempt + 1}: "
+                     f"{'; '.join(defects)}", "WARNING")
+        deduped: Dict[str, Dict[str, Any]] = {}
+        for f in all_results:
+            if isinstance(f.get('id'), str) and f['id']:
+                deduped.setdefault(f['id'], f)
+        all_results = list(deduped.values())
 
         payload = {
             'dataset_id': dataset_id,
             'results': all_results,
             'count': len(all_results),
             'declared_count': total,
-            'complete': total is None or len(all_results) >= total,
+            'complete': not defects and total is not None and len(all_results) == total,
+            'defects': defects,
+            'fetched_at': time.time(),
         }
-        # Store a definitive empty answer too (the server said count=0), otherwise
-        # every resume re-asks about datasets that have no fields in this
-        # configuration. A blank body with no count is NOT definitive and is left
-        # unstored so it gets retried.
-        if all_results or total == 0:
-            await self.store.put('datafields_ds', key, payload,
-                                 key_params={'instrumentType': instrument_type, 'region': region,
-                                             'delay': delay, 'universe': universe,
-                                             'dataset_id': dataset_id})
-        return payload
+        # Incomplete attempts never replace a previous record or become a cache hit.
+        # A verified zero-field dataset is complete and can still be persisted.
+        if payload['complete']:
+            written = await self.store.put('datafields_ds', key, payload,
+                                          key_params={'instrumentType': instrument_type, 'region': region,
+                                                      'delay': delay, 'universe': universe,
+                                                      'dataset_id': dataset_id})
+            if not written:
+                raise OSError(f'Could not persist dataset {dataset_id}')
+        return {**payload, 'cache_updated': payload['complete'], 'from_cache': False}
 
     async def build_full_datafield_catalogue(
         self,
@@ -3628,70 +3728,96 @@ class BrainApiClient:
         force_refresh: bool = False,
         progress: Optional[Any] = None,
     ) -> Dict[str, Any]:
-        """Assemble the COMPLETE datafield catalogue, dataset by dataset.
+        """Resume per-dataset work; publish only a fully verified configuration."""
+        cfg = {'instrumentType': instrument_type, 'region': region,
+               'delay': delay, 'universe': universe}
+        try:
+            datasets = await self.get_datasets(None, region, delay, universe, 'false', None,
+                                               force_refresh=True)
+        except Exception as e:
+            return {'complete': False, 'cache_updated': False, 'error': str(e),
+                    'incomplete_datasets': [], 'results': [], 'count': 0}
+        return await self._build_catalogue_config(cfg, datasets, force_refresh=force_refresh,
+                                                  progress=progress)
 
-        Resumable: datasets already stored are skipped unless force_refresh.
-        """
-        datasets = await self.get_datasets(None, region, delay, universe, 'false', None)
-        drows = [x for x in (datasets.get('results') or []) if isinstance(x, dict)]
-        cfg = self._df_config_key(instrument_type, region, delay, universe)
+    async def _publish_catalogue(self, cfg: Dict[str, Any], payload: Dict[str, Any],
+                                 keep: set) -> Dict[str, Any]:
+        """Publish before pruning, so a failed write cannot remove old dataset blocks."""
+        if not payload.get('complete'):
+            raise ValueError('Cannot publish an incomplete catalogue')
+        cache_params = {**cfg, 'theme': 'false', 'dataset_id': None, 'data_type': ''}
+        written = await self.store.put(
+            'datafields', self._generate_cache_key('datafields', cache_params),
+            payload, key_params=cache_params)
+        if not written:
+            raise OSError('Could not persist configuration catalogue; old blocks retained')
+        try:
+            pruned = await self._prune_dataset_blocks(cfg, keep)
+        except Exception as e:
+            return {**payload, 'cache_updated': True,
+                    'error': f'Catalogue saved, but pruning did not finish: {e}'}
+        return {**payload, 'cache_updated': True, 'pruned_datasets': pruned}
 
-        merged: List[Dict[str, Any]] = []
-        seen: set = set()
-        per_dataset: Dict[str, Any] = {}
-        incomplete: List[str] = []
+    async def _build_catalogue_config(self, cfg: Dict[str, Any], datasets: Dict[str, Any],
+                                      force_refresh: bool = False, progress=None,
+                                      on_dataset=None) -> Dict[str, Any]:
+        """Keep successful dataset checkpoints, but never publish a partial aggregate."""
+        drows = datasets.get('results') or []
+        if not datasets.get('complete') or not drows:
+            return {'complete': False, 'cache_updated': False, 'results': [], 'count': 0,
+                    'datasets': len(drows), 'incomplete_datasets': [],
+                    'error': 'Empty or unverified dataset listing; old catalogue retained'}
+        merged, seen, shared_ids = [], set(), set()
+        per_dataset, incomplete = {}, []
         fetched_rows = 0
-        shared_ids: List[str] = []
-
         for i, ds in enumerate(drows, 1):
-            dsid = ds.get('id')
-            if not dsid:
-                continue
+            dsid = ds['id']
+            rows = []
             try:
                 block = await self.get_dataset_fields(
-                    dsid, instrument_type, region, delay, universe, force_refresh=force_refresh)
+                    dsid, cfg['instrumentType'], cfg['region'], cfg['delay'], cfg['universe'],
+                    force_refresh=force_refresh, expected_count=ds['fieldCount'])
+                rows = block.get('results') or []
+                complete = (block.get('complete') is True and not block.get('defects')
+                            and len(rows) == ds['fieldCount'])
+                per_dataset[dsid] = {'fields': len(rows), 'declared': ds['fieldCount'],
+                                     'complete': complete, 'defects': block.get('defects') or []}
+                if not complete:
+                    incomplete.append(dsid)
+                fetched_rows += len(rows)
+                for field in rows:
+                    fid = field['id']
+                    if fid in seen:
+                        shared_ids.add(fid)
+                    else:
+                        seen.add(fid)
+                        merged.append(field)
             except Exception as e:
-                self.log(f"[catalogue] {dsid} failed: {e}", "WARNING")
-                per_dataset[dsid] = {'error': str(e)}
-                continue
-            rows = block.get('results') or []
-            fetched_rows += len(rows)
-            for f in rows:
-                fid = f.get('id')
-                if not fid:
-                    continue
-                if fid in seen:
-                    shared_ids.append(fid)
-                    continue
-                seen.add(fid)
-                merged.append(f)
-            per_dataset[dsid] = {'fields': len(rows), 'declared': ds.get('fieldCount'),
-                                 'complete': block.get('complete')}
-            if (ds.get('fieldCount') or 0) > len(rows):
                 incomplete.append(dsid)
+                per_dataset[dsid] = {'complete': False, 'error': str(e)}
+                self.log(f"[catalogue] {dsid} failed: {e}", "WARNING")
+            if on_dataset:
+                on_dataset(len(rows), len(merged))
             if progress and i % 10 == 0:
                 self.log(f"[catalogue] {i}/{len(drows)} datasets, {len(merged)} fields", "INFO")
 
-        declared_total = sum(x.get('fieldCount') or 0 for x in drows)
-        complete_payload = {
-            'results': merged,
-            'count': len(merged),
-            'fetched_rows': fetched_rows,
-            'declared_total': declared_total,
-            'coverage': round(fetched_rows / declared_total, 4) if declared_total else None,
-            'datasets': len(drows),
-            'incomplete_datasets': incomplete,
-            'fields_in_two_datasets': sorted(set(shared_ids)),
+        declared = sum(ds['fieldCount'] for ds in drows)
+        payload = {
+            'results': merged, 'count': len(merged), 'fetched_rows': fetched_rows,
+            'declared_total': declared,
+            'coverage': round(fetched_rows / declared, 4) if declared else None,
+            'datasets': len(drows), 'incomplete_datasets': incomplete,
+            'per_dataset': per_dataset, 'complete': not incomplete,
+            'fields_in_two_datasets': sorted(shared_ids),
             'built_via': 'per-dataset sweep (bypasses the 10000-row global cap)',
             'from_cache': False,
         }
-        # Write it to the same key the normal reads use, so every existing caller
-        # transparently gets the complete catalogue from here on.
-        cache_params = {'instrumentType': instrument_type, 'region': region, 'delay': delay,
-                        'universe': universe, 'theme': 'false', 'dataset_id': None, 'data_type': ''}
-        await self.store.put('datafields', self._generate_cache_key('datafields', cache_params),
-                             complete_payload, key_params=cache_params)
-        return complete_payload
+        if incomplete:
+            return {**payload, 'cache_updated': False, 'pruned_datasets': []}
+        try:
+            return await self._publish_catalogue(cfg, payload, {ds['id'] for ds in drows})
+        except Exception as e:
+            return {**payload, 'cache_updated': False, 'error': str(e)}
 
     # --- Alpha corpus sync (background) ------------------------------------- #
 
@@ -4073,7 +4199,7 @@ class BrainApiClient:
         if self._catalogue_task and not self._catalogue_task.done():
             return {'started': False, 'reason': 'already running', **self._catalogue_snapshot()}
 
-        targets = configs or self._configs_in_use()
+        targets = self._configs_in_use() if configs is None else configs
         if not targets:
             return {'started': False, 'reason': 'no market configurations found'}
 
@@ -4095,141 +4221,93 @@ class BrainApiClient:
 
     async def _run_catalogue_build(self, targets: List[Dict[str, Any]], mode: str = 'dedup') -> None:
         st = self._catalogue_state
-        # Which field ids exist is a property of (region, delay) -- verified live:
-        # option4 returns the same 1298 ids for USA/TOP500 and USA/TOP3000, and
-        # every USA universe declares the same 345 datasets / 91076 fields. Only
-        # the per-field usage metrics (userCount, alphaCount, coverage) differ.
-        # In 'dedup' mode a configuration whose dataset list is identical to one
-        # already built reuses that catalogue instead of re-downloading it, which
-        # halves the work; the payload records which universe the metrics came from.
+        # Reuse only a fully published configuration with identical per-dataset counts.
+        # Usage metrics remain those of the source universe, explicitly labelled below.
         built_by_signature: Dict[Any, Dict[str, Any]] = {}
         try:
             st['status'] = 'running'
             for cfg in targets:
                 label = f"{cfg['region']}/{cfg['universe']}/delay{cfg['delay']}"
                 st['current'] = label
+                row = {'status': 'running', 'complete': False, 'cache_updated': False}
+                st['per_config'][label] = row
                 try:
                     datasets = await self.get_datasets(
-                        None, cfg['region'], cfg['delay'], cfg['universe'], 'false', None)
+                        None, cfg['region'], cfg['delay'], cfg['universe'], 'false', None,
+                        force_refresh=True)
+                    drows = datasets.get('results') or []
+                    if not datasets.get('complete') or not drows:
+                        raise ValueError('Empty or unverified dataset listing; old catalogue retained')
+                    declared = sum(ds['fieldCount'] for ds in drows)
+                    row.update(datasets=len(drows), declared=declared, fields=0)
+                    signature = (cfg['instrumentType'], cfg['region'], cfg['delay'],
+                                 tuple(sorted((ds['id'], ds['fieldCount']) for ds in drows)))
+                    prior = built_by_signature.get(signature)
+                    if mode == 'dedup' and prior is not None:
+                        payload = {**prior['payload'], 'metrics_from_universe': prior['universe']}
+                        payload.pop('pruned_datasets', None)
+                        payload.pop('cache_updated', None)
+                        payload['note'] = (
+                            f"Reused {cfg['region']}/{prior['universe']}'s field catalogue. "
+                            'userCount / alphaCount / coverage belong to that universe. '
+                            'Use mode="all" for per-universe metrics.')
+                        payload = await self._publish_catalogue(cfg, payload, set())
+                        row['reused_from'] = f"{cfg['region']}/{prior['universe']}"
+                    else:
+                        st['fields_declared'] += declared
+                        st['datasets_total'] += len(drows)
+
+                        def advance(count, merged_count):
+                            st['datasets_done'] += 1
+                            st['fields_done'] += count
+                            row['fields'] = merged_count
+
+                        payload = await self._build_catalogue_config(cfg, datasets, on_dataset=advance)
+                    published = (payload.get('complete') and payload.get('cache_updated')
+                                 and not payload.get('error'))
+                    row.update(
+                        status=('reused' if 'reused_from' in row else 'done') if published else 'incomplete',
+                        complete=bool(payload.get('complete')), cache_updated=bool(payload.get('cache_updated')),
+                        fields=payload.get('count'), coverage=payload.get('coverage'),
+                        incomplete=len(payload.get('incomplete_datasets') or []),
+                        incomplete_datasets=payload.get('incomplete_datasets') or [],
+                        per_dataset=payload.get('per_dataset') or {},
+                        pruned=(len(payload['pruned_datasets']) if 'pruned_datasets' in payload else None))
+                    if payload.get('error'):
+                        row['error'] = payload['error']
+                    if published and 'reused_from' not in row:
+                        built_by_signature[signature] = {'universe': cfg['universe'], 'payload': payload}
+                    self.log(f"[catalogue] {label}: {row['status']}, {row['fields']} fields", "INFO")
                 except Exception as e:
-                    st['per_config'][label] = {'error': f'dataset list failed: {e}'}
-                    st['configs_done'] += 1
-                    continue
-                drows = [x for x in (datasets.get('results') or []) if isinstance(x, dict) and x.get('id')]
-                declared = sum(x.get('fieldCount') or 0 for x in drows)
-
-                if not drows:
-                    # The platform serves no datasets for this configuration.
-                    st['per_config'][label] = {'datasets': 0, 'declared': 0, 'fields': 0,
-                                               'status': 'empty',
-                                               'note': 'platform returns no datasets for this configuration'}
-                    st['configs_done'] += 1
-                    continue
-
-                signature = (cfg['instrumentType'], cfg['region'], cfg['delay'],
-                             len(drows), declared, tuple(sorted(x['id'] for x in drows)))
-                prior = built_by_signature.get(signature)
-                if mode == 'dedup' and prior is not None:
-                    payload = dict(prior['payload'])
-                    payload['metrics_from_universe'] = prior['universe']
-                    payload['note'] = (
-                        f"Field set is identical to {cfg['region']}/{prior['universe']}; reused to "
-                        "avoid re-downloading it. The per-field userCount / alphaCount / coverage "
-                        f"in this payload are {prior['universe']}'s. Rebuild this configuration on "
-                        "its own if you need its real usage metrics."
-                    )
-                    cache_params = {'instrumentType': cfg['instrumentType'], 'region': cfg['region'],
-                                    'delay': cfg['delay'], 'universe': cfg['universe'],
-                                    'theme': 'false', 'dataset_id': None, 'data_type': ''}
-                    await self.store.put('datafields',
-                                         self._generate_cache_key('datafields', cache_params),
-                                         payload, key_params=cache_params)
-                    st['per_config'][label] = {
-                        'datasets': len(drows), 'declared': declared,
-                        'fields': payload.get('count'), 'status': 'reused',
-                        'reused_from': f"{cfg['region']}/{prior['universe']}",
-                        'coverage': payload.get('coverage'),
-                    }
-                    st['configs_done'] += 1
-                    self.log(f"[catalogue] {label} reused from {prior['universe']} "
-                             f"({payload.get('count')} fields, no download)", "INFO")
-                    continue
-
-                st['fields_declared'] += declared
-                st['datasets_total'] += len(drows)
-                st['per_config'][label] = {'datasets': len(drows), 'declared': declared,
-                                           'fields': 0, 'status': 'running'}
-
-                merged: List[Dict[str, Any]] = []
-                seen: set = set()
-                incomplete: List[str] = []
-                fetched_rows = 0
-                shared_ids: List[str] = []
-                for ds in drows:
-                    dsid = ds['id']
-                    try:
-                        block = await self.get_dataset_fields(
-                            dsid, cfg['instrumentType'], cfg['region'], cfg['delay'], cfg['universe'])
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as e:
-                        self.log(f"[catalogue] {label} {dsid} failed: {e}", "WARNING")
-                        incomplete.append(dsid)
-                        st['datasets_done'] += 1
-                        continue
-                    rows = block.get('results') or []
-                    fetched_rows += len(rows)
-                    for f in rows:
-                        fid = f.get('id')
-                        if not fid:
-                            continue
-                        if fid in seen:
-                            # The same field id can be published under two
-                            # datasets; that is not a duplicate download.
-                            shared_ids.append(fid)
-                            continue
-                        seen.add(fid)
-                        merged.append(f)
-                    if (ds.get('fieldCount') or 0) > len(rows):
-                        incomplete.append(dsid)
-                    st['datasets_done'] += 1
-                    st['fields_done'] += len(rows)
-                    st['per_config'][label]['fields'] = len(merged)
-
-                payload = {
-                    'results': merged,
-                    'count': len(merged),
-                    'fetched_rows': fetched_rows,
-                    'declared_total': declared,
-                    'coverage': round(fetched_rows / declared, 4) if declared else None,
-                    'datasets': len(drows),
-                    'incomplete_datasets': incomplete,
-                    'fields_in_two_datasets': sorted(set(shared_ids)),
-                    'built_via': 'per-dataset sweep (bypasses the 10000-row global cap)',
-                    'from_cache': False,
-                }
-                cache_params = {'instrumentType': cfg['instrumentType'], 'region': cfg['region'],
-                                'delay': cfg['delay'], 'universe': cfg['universe'],
-                                'theme': 'false', 'dataset_id': None, 'data_type': ''}
-                await self.store.put('datafields',
-                                     self._generate_cache_key('datafields', cache_params),
-                                     payload, key_params=cache_params)
-                built_by_signature[signature] = {'universe': cfg['universe'], 'payload': payload}
-                st['per_config'][label].update(
-                    {'status': 'done', 'fields': len(merged),
-                     'coverage': payload['coverage'], 'incomplete': len(incomplete)})
+                    row.update(status='incomplete', error=str(e))
+                    self.log(f"[catalogue] {label} failed: {e}", "WARNING")
                 st['configs_done'] += 1
-                self.log(f"[catalogue] {label} complete: {len(merged)}/{declared} fields", "INFO")
-            st['status'] = 'complete'
-            st['current'] = None
+            st['status'] = ('partial' if any(r['status'] == 'incomplete'
+                                            for r in st['per_config'].values()) else 'complete')
         except asyncio.CancelledError:
             st['status'] = 'stopped'
-            self.log("[catalogue] Build stopped; progress is on disk and will resume.", "INFO")
+            self.log('[catalogue] Build stopped; verified datasets remain on disk.', 'INFO')
             raise
         except Exception as e:
             st['status'] = 'error'
             st['error'] = str(e)
-            self.log(f"[catalogue] Build failed: {e}", "ERROR")
+            self.log(f"[catalogue] Build failed: {e}", 'ERROR')
+        finally:
+            st['current'] = None
+
+    async def _prune_dataset_blocks(self, cfg: Dict[str, Any], keep: set) -> List[str]:
+        """Delete a configuration's per-dataset blocks whose dataset is not in ``keep``."""
+        prefix = self._df_config_key(cfg['instrumentType'], cfg['region'],
+                                     cfg['delay'], cfg['universe']) + ':'
+        pruned = []
+        for entry in await self.store.list_entries('datafields_ds'):
+            k = entry.get('key') or ''
+            if k.startswith(prefix) and k[len(prefix):] not in keep:
+                if await self.store.delete('datafields_ds', k):
+                    pruned.append(k[len(prefix):])
+                else:
+                    raise OSError(f'Could not prune dataset block {k}')
+        return pruned
 
     async def stop_catalogue_build(self) -> Dict[str, Any]:
         task = self._catalogue_task
@@ -7047,11 +7125,18 @@ class BrainApiClient:
         await self.ensure_authenticated()
         
         try:
-            # todo: ra_failed_count 是否为0
+            # The platform replaces the whole tag list. Resolve omitted tags
+            # before PATCH so lookup failures cannot silently clear them.
+            if tags is None:
+                current = await self.get_alpha_details(alpha_id, force_refresh=True)
+                if (not isinstance(current, dict) or "error" in current
+                        or not isinstance(current.get("tags"), list)):
+                    raise ValueError("Could not read current alpha tags")
+                tags = list(current.get("tags") or [])
             payload = {
                 "color": color,
                 "name": name,
-                "tags": tags if tags is not None else [],
+                "tags": tags,
                 "regular": {"description": descriptions}
             }
             if selection_description is not None:
@@ -7691,6 +7776,14 @@ def _slim_alpha_response(obj):
     return _rewrap(_slim_alpha(payload), w)
 
 
+def _annotate_quick_mode(obj):
+    """Mark a QUICK-mode result so nobody hands the alpha to submit_alpha as-is."""
+    payload, w = _unwrap_result(obj)
+    if _is_error(payload) or not isinstance(payload, dict):
+        return obj
+    return _rewrap({**payload, "simulation_mode": "QUICK", "quick_mode_note": _QUICK_MODE_NOTE}, w)
+
+
 def _slim_alpha_list(obj):
     payload, w = _unwrap_result(obj)
     if not isinstance(payload, dict) or "results" not in payload:
@@ -7840,7 +7933,7 @@ def _slim_datafields(obj, limit: int = 50, offset: int = 0, sort: str = "userCou
               "coverage", "declared_total", "declared_count", "complete",
               "incomplete_datasets", "dataset_id", "filtered_since",
               "fetched_rows", "fields_in_two_datasets", "metrics_from_universe", "note",
-              "search_mode"):
+              "search_mode", "defects", "cache_updated", "error"):
         if k in payload:
             out[k] = payload[k]
     return _rewrap(out, w)
@@ -8188,6 +8281,13 @@ async def create_simulation(
     """
     Create a new simulation on BRAIN platform.
 
+    SIMULATION MODE: simulation_mode="QUICK" is for fast iteration. It returns
+    PnL, sub-universe PnL, weight concentration, fitness, IS ladder, Sharpe,
+    returns and turnover only: no visualization, no Theme / Competition /
+    correlation checks, and the alpha is NOT submittable directly. The default
+    "FULL" runs every check and is what a near-submission alpha needs. A QUICK
+    result never satisfies a later FULL request from the local ledger.
+
     This tool creates and starts a simulation with your alpha code. Use this after you have your alpha formula ready.
 
     Every completed backtest is recorded locally. If this exact expression and
@@ -8232,6 +8332,8 @@ async def create_simulation(
         combo: Combo code (for SUPER type)
         selection: Selection code (for SUPER type). For USA SUPER simulations,
             this must include (prod_correlation > 0)
+        simulation_mode: "FULL" (default, all checks) or "QUICK" (fast, no
+            checks, not submittable directly)
     
     Returns:
         Simulation creation result with ID and location
@@ -8240,6 +8342,7 @@ async def create_simulation(
     visualization = False
     try:
         normalized_language = language.upper()
+        normalized_mode = _normalize_simulation_mode(simulation_mode)
         settings_kwargs = {
             "instrumentType": instrument_type,
             "region": region,
@@ -8279,8 +8382,11 @@ async def create_simulation(
             selection=selection
         )
         
-        return _slim_alpha_response(
+        result = _slim_alpha_response(
             await brain_client.create_simulation(sim_data, reuse_existing=reuse_existing))
+        if normalized_mode == "QUICK":
+            result = _annotate_quick_mode(result)
+        return result
     except Exception as e:
         extra_info = ""
         error_msg = str(e)
@@ -9135,6 +9241,7 @@ async def set_alpha_properties(alpha_id: str, name: Optional[str] = None,
         name: 使用生产相关性和自相关性命名，不能带空格；建议基于 correlation
         的最大值命名，例如 `0.6534_0.2306` 表示 prod correlation = 0.6534, self correlation = 0.2306；
         tags 如果alpha质量非常好可以设置 `PowerPoolSelected`，质量不好或不好判断就不要设置tag；
+        tags 不传时保留当前标签；显式列表替换标签，[] 清空标签。
         descriptions: Write in English, <=100 words. The three sections MUST be separated by
         actual newline characters (i.e. use the JSON escape sequence \\n\\n between sections,
         NOT the literal text "\\n\\n"). Example value:
@@ -9595,6 +9702,9 @@ async def create_multi_simulation(
         visualization: Enable visualization (default: False)
         pasteurization: Pasteurization setting (default: "ON")
         max_trade: Max trade setting (default: "OFF")
+        simulation_mode: "FULL" (default, all checks) or "QUICK" (fast feedback:
+            metrics only, no visualization / Theme / Competition / correlation
+            checks, alphas not submittable directly; visualization is forced off)
     
     Returns:
         Dictionary containing multisimulation results and individual alpha details
@@ -9610,6 +9720,8 @@ async def create_multi_simulation(
         sim_type = type.upper()
         if sim_type not in ("REGULAR", "REGION_AGNOSTIC"):
             return {"error": f'type must be "REGULAR" or "REGION_AGNOSTIC"; got "{type}"'}
+        if normalized_mode == "QUICK":
+            visualization = False
         # The platform validates each item of the batch separately, so a settings
         # mistake would cost a full round trip per expression. Check the
         # all-region rules once, here.
@@ -9674,7 +9786,10 @@ async def create_multi_simulation(
             return {"error": "No location header in multisimulation response"}
         
         # Wait for children to appear and get results
-        return _slim_multisim(await _wait_for_multisimulation_completion(location, len(alpha_expressions)))
+        result = _slim_multisim(await _wait_for_multisimulation_completion(location, len(alpha_expressions)))
+        if normalized_mode == "QUICK" and isinstance(result, dict) and not _is_error(result):
+            result = {**result, "simulation_mode": "QUICK", "quick_mode_note": _QUICK_MODE_NOTE}
+        return result
         
     except Exception as e:
         return {"error": f"Error creating multisimulation: {str(e)}"}
@@ -9813,6 +9928,8 @@ def _build_multisim_payload(alpha_expressions, instrument_type, region, universe
                             simulation_mode="FULL"):
     normalized_language = language.upper()
     normalized_mode = _normalize_simulation_mode(simulation_mode)
+    if normalized_mode == "QUICK":
+        visualization = False
     payload = []
     for alpha_expr in alpha_expressions:
         settings = {
@@ -9902,6 +10019,8 @@ async def submit_multi_simulation(
             "location": location,
             "multisimulation_id": location.rstrip('/').split('/')[-1],
             "n_expressions": len(alpha_expressions),
+            "simulation_mode": normalized_mode or "FULL",
+            **({"quick_mode_note": _QUICK_MODE_NOTE} if normalized_mode == "QUICK" else {}),
         }
     except Exception as e:
         return {"error": f"Error submitting multisimulation: {str(e)}"}
@@ -10306,6 +10425,7 @@ async def build_datafield_catalogue(
     universe: Optional[str] = None,
     delay: Optional[int] = None,
     instrument_type: str = "EQUITY",
+    all_regions: bool = False,
 ) -> Dict[str, Any]:
     """Build the COMPLETE datafield catalogue, dataset by dataset, in the background.
 
@@ -10322,14 +10442,22 @@ async def build_datafield_catalogue(
     thinks it owns the whole 30/min budget, and the two would collide into 429s).
     Expect foreground calls to be ~1-2s slower while it runs.
 
-    Fully resumable: datasets already stored are skipped, so stopping and
-    restarting never repeats work.
+    Resumable: verified datasets matching the fresh fieldCount are reused.
+    Incomplete attempts preserve old records and are retried on the next build.
 
     action:
       - "status" (default) progress, coverage and ETA. No side effects.
       - "start"  begin building every market configuration this account uses
                  (derived from the OS PnL pools). Returns immediately.
-                 Pass region/universe/delay to build just one configuration.
+                 Pass region/universe/delay to build just one configuration, or
+                 all_regions=True for every region/delay/universe the platform
+                 currently offers this account (new regions included).
+                 Every dataset is checked against the fresh listing's fieldCount;
+                 a stored block that disagrees is refetched, and blocks for
+                 datasets no longer listed are deleted only after the entire
+                 configuration is verified and its catalogue is written.
+                 Failed configurations retain their previous catalogue and report
+                 status="incomplete"; the overall build then ends as "partial".
       - "stop"   cancel the running build; finished datasets stay on disk.
 
     mode (for "start"):
@@ -10373,6 +10501,13 @@ async def build_datafield_catalogue(
         if region and universe and delay is not None:
             configs = [{'instrumentType': instrument_type, 'region': region,
                         'universe': universe, 'delay': delay}]
+        elif all_regions:
+            opts = await client.get_platform_setting_options()
+            configs = [{'instrumentType': row['InstrumentType'], 'region': row['Region'],
+                        'universe': u, 'delay': row['Delay']}
+                       for row in opts.get('instrument_options') or []
+                       if row['InstrumentType'] == instrument_type
+                       for u in row.get('Universe') or []]
         if mode not in ('dedup', 'all'):
             return {'error': f'Unknown mode {mode!r}', 'valid': ['dedup', 'all']}
         return await client.start_catalogue_build(configs, mode=mode)
@@ -10593,6 +10728,11 @@ async def sync_platform_cache(
         return {
             'scope': 'datafields_full',
             'config': {'region': region, 'universe': universe, 'delay': delay},
+            'complete': result.get('complete'),
+            'cache_updated': result.get('cache_updated'),
+            'error': result.get('error'),
+            'per_dataset': result.get('per_dataset'),
+            'pruned_datasets': result.get('pruned_datasets'),
             'fields': result.get('count'),
             'declared_total': result.get('declared_total'),
             'coverage': result.get('coverage'),

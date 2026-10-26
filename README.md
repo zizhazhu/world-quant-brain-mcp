@@ -428,6 +428,20 @@ submit_multi_simulation(["rank(-returns)", "rank(volume)"], simulation_mode="QUI
 
 `get_platform_setting_options` 现在额外返回 `simulation_modes`，直接从平台 OPTIONS 读出这两档；缺这个键的旧缓存会被判为 miss 并重新拉取。
 
+| | `FULL`（默认） | `QUICK` |
+| --- | --- | --- |
+| 用途 | 接近成型、准备提交的 alpha | 快速试错、批量筛想法 |
+| 结果 | 与之前完全一致 | PnL、子 universe PnL、权重集中度、Fitness、IS ladder、Sharpe、Returns、Turnover |
+| 可视化 | 批量入口可选；单次入口仍关闭 | 无（本服务强制 `visualization=false`） |
+| Theme / Competition / 相关性 / Cluster 检查 | 有 | **没有** |
+| 能否直接提交 | 通过平台提交检查后可提交 | **不能**，要用 `FULL` 重跑同一表达式 |
+
+`create_simulation`、`create_multi_simulation` 和 `submit_multi_simulation` 的 QUICK 成功响应带 `simulation_mode: "QUICK"` 和 `quick_mode_note`，提示用 FULL 重跑后再提交。显式 `simulationMode: "FULL"` 与省略该字段计算相同的账本指纹；请求中仍省略 FULL 字段。
+
+### Alpha 标签更新
+
+`set_alpha_properties` 不传 `tags` 时先读取最新标签并保留；读取失败则返回错误，不发送 PATCH。显式列表会替换原标签，`[]` 可以清空。本分支不引入上游的 Power Pool 收益门槛、universe 禁用或已有标签强制保留策略，`PowerPoolSelected` 按普通标签处理。
+
 ### 模拟账本（回测去重）
 
 通过 `create_simulation` 完成的单次回测会记录到 `cache/simulations/ledger.jsonl`——表达式、settings、alpha_id、IS 指标。带来两件事：
@@ -455,6 +469,8 @@ submit_multi_simulation(["rank(-returns)", "rank(volume)"], simulation_mode="QUI
 
 术语表是一篇几乎不变的文章，此前每次调用都要拉起一个无头浏览器，现已永久存盘。帖子正文写定后不变、评论增长缓慢，按 `FORUM_POST_TTL_SECONDS`（默认 24h）缓存，`force_refresh=true` 可强制回源。
 
+论坛搜索会还原 Zendesk `/search/click` 跳转链接，返回可直接读帖的真实地址；读帖也兼容旧跳转地址，搜索词中的 `&`、`#` 会进行 URL 编码。
+
 ### 数据目录的完整性（重要）
 
 `/data-fields` 的**无过滤窗口硬性截断在 10000 行**，而且 `count` 也在 10000 饱和，所以从返回值上看不出被截断：
@@ -468,7 +484,7 @@ USA/TOP3000 的数据集声明 **91,076** 个字段，全局扫描只能拿到 *
 
 出路是按 `dataset.id` 查询——该过滤会解除上限（`dataset.id=pv87` 返回完整的 6666）。因此：
 
-- `get_datafields(dataset_id=...)` 对该数据集**始终完整**，并永久存盘
+- `get_datafields(dataset_id=...)` 按数据集分页抓取并验证完整性，仅完整结果永久存盘；失败响应带 `complete: false` 和 `defects`
 - 不带 `dataset_id` 的结果若触及上限，会带上 `capped: true` 和明确的 `warning`
 - `build_datafield_catalogue(action="start")` 逐数据集重建完整目录
 
@@ -476,8 +492,26 @@ USA/TOP3000 的数据集声明 **91,076** 个字段，全局扫描只能拿到 *
 
 完整性已实测验证：DEU/TOP500 重建后 **178/178 数据集、22,494/22,494 声明字段全部到手**，零字段数据集归零。注意合并后唯一字段是 22,492——因为**一个字段可以同时属于两个数据集**（该配置下 `price_momentum_12m_minus_1m` 同属 `analyst94` 和 `model109`，`baltic_dry_index` 同属 `model193` 和 `model219`）。所以完整性按**抓取行数**判定，不是按去重后的数量，否则每个建完的目录都会被误报为缺失。
 
-完全可续跑：已存盘的数据集自动跳过（实测停止后重启，20 秒跳过已完成的 14 个数据集）。`action="status"` 看进度和 ETA，`action="stop"` 随时中断。
+可续跑：每次构建刷新数据集清单，只有完整、无缺陷且字段数匹配最新 `fieldCount` 的数据集缓存才会复用。`action="status"` 看进度和 ETA，`action="stop"` 随时中断。
 `sync_platform_cache(scope="status")` 会列出每个配置的 `declared / stored / coverage`，哪些配置还有盲区一眼可见。
+
+#### 刷新与旧记录保护
+
+默认的数据集请求不再发送 `theme=false`，以免漏掉挂有主题的数据集；明确指定 `theme=true` 才筛选主题。已有缓存不会因代码升级自动刷新。
+
+`build_datafield_catalogue(action="start")` 和 `sync_platform_cache(scope="datafields_full", ..., confirm=True)` 使用相同的保护规则：
+
+- 校验最新数据集清单的数量、唯一 ID 和 `fieldCount`；分页缺失、重复、计数变化或空清单都不会触发清空旧目录。
+- 字段分页有重复或数量不符时最多尝试三次；单数据集超过 10000 条时按字段类型拆分，再核对唯一 ID 数量。
+- 完整的数据集可单独保存作为续跑进度；失败或不完整结果不覆盖旧数据集缓存，也不保存为新缓存。
+- 只有整个配置完整且汇总目录写入成功后，才清理该配置中已下架数据集的缓存。抓取或校验失败的配置保留旧汇总目录，成功的数据集仍可供下次复用。
+- `dedup` 只复用本轮已完整写入的配置；复用目录写入成功后才清理被替代的逐数据集缓存。使用指标的来源保留在 `metrics_from_universe`，需要各 universe 自身指标请使用 `mode="all"`。
+
+结果中的 `complete` 表示抓取是否完整，`cache_updated` 表示本次是否更新缓存。后台失败配置标记为 `incomplete`，任务最终为 `partial`，并通过 `incomplete_datasets`、`per_dataset` 或 `error` 给出原因。`complete=true` 但 `cache_updated=false` 也可能表示汇总写入失败，应同时检查错误信息。若汇总已写入但后续清理失败，则 `cache_updated=true`，同时返回清理错误，后台任务仍为 `partial`。
+
+新增可选的 `all_regions=True` 会按当前平台选项构建所有 region/delay/universe，默认仍为 `False`。它只在显式启动时生效，不会在升级或服务启动时自动抓取。
+
+目录刷新不会自动重建 SQLite 全文索引；需要时再调用 `sync_platform_cache(scope="field_index")`。字段目录更新不会改写历史表达式、回测结果或模拟账本。
 
 #### 构建成本与去重
 
@@ -794,3 +828,14 @@ analyst 需 3、news 需 1 时只点亮 1 座，现在是 3+1 点亮 2 座（`pl
   `not_attempted` / `retry_after`，等这个秒数后再调一次继续。
 - **这些工具不会提交任何 alpha**，只产出计划，提交由人工执行。
 - 测试：`python test_candidate_pool.py`（使用假客户端，不触网）。
+
+### 上游合并离线验证
+
+使用已安装依赖的 Python 环境运行 `test_simulation_mode.py`、`test_inflight_simulations.py` 和 `test_upstream_merge.py`。后者覆盖字段缓存失败保护、目录发布与清理顺序、Quick Mode 补强、标签行为和论坛链接修复；平台及浏览器响应均为模拟数据，缓存写入临时目录。候选池测试可用相同 MCP 测试替身运行，避免本地 MCP 版本差异导致跳过客户端断言：
+
+```sh
+.venv/bin/python test_simulation_mode.py
+.venv/bin/python test_inflight_simulations.py
+.venv/bin/python test_upstream_merge.py
+.venv/bin/python -c 'import runpy; import test_simulation_mode; runpy.run_path("test_candidate_pool.py", run_name="__main__")'
+```
